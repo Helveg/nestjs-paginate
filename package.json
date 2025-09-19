@@ -1,6 +1,6 @@
 {
   "name": "@helveg/nestjs-paginate",
-  "version": "11.1.4",
+  "version": "11.1.5",
   "author": "Philipp Petzold <ppetzold@protonmail.com>",
   "license": "MIT",
   "main": "lib/index.js",
