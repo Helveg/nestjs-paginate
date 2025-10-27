@@ -34,6 +34,25 @@ cases this package might not work without it.
 
 ## Usage
 
+### Global configurations
+
+You can configure the global settings for all paginated routes by updating the default global configuration
+using below method. Ideally, you need to do it as soon as possible in your application main bootstrap method,
+as it affects all paginated routes, and swagger generation logic.
+
+```typescript
+import { updateGlobalConfig } from 'nestjs-paginate'
+
+updateGlobalConfig({
+  // this is default configuration
+  defaultOrigin: undefined,
+  defaultLimit: 20,
+  defaultMaxLimit: 100,
+});
+```
+
+
+
 ### Example
 
 The following code exposes a route that can be utilized like so:
@@ -41,7 +60,7 @@ The following code exposes a route that can be utilized like so:
 #### Endpoint
 
 ```url
-http://localhost:3000/cats?limit=5&page=2&sortBy=color:DESC&search=i&filter.age=$gte:3&select=id,name,color,age
+http://localhost:3000/cats?limit=5&page=2&sortBy=color:DESC&search=i&filter.age=$gte:3&select=id,name,color,age&withDeleted=true
 ```
 
 #### Result
@@ -108,7 +127,7 @@ The following code exposes a route using cursor-based pagination:
 #### Endpoint
 
 ```url
-http://localhost:3000/cats?limit=5&cursor=2022-12-20T10:00:00.000Z&cursorColumn=lastVetVisit&cursorDirection=after
+http://localhost:3000/cats?limit=5&sortBy=lastVetVisit:ASC&cursor=V998328469600000
 ```
 
 #### Result
@@ -144,14 +163,12 @@ http://localhost:3000/cats?limit=5&cursor=2022-12-20T10:00:00.000Z&cursorColumn=
   ],
   "meta": {
     "itemsPerPage": 5,
-    "cursor": "2022-12-20T10:00:00.000Z",
-    "firstCursor": "2022-12-21T10:00:00.000Z",
-    "lastCursor": "2022-12-25T10:00:00.000Z"
+    "cursor": "V998328469600000"
   },
   "links": {
-    "previous": "http://localhost:3000/cats?limit=5&sortBy=lastVetVisit:ASC&cursor=2022-12-21T10:00:00.000Z&cursorColumn=lastVetVisit&cursorDirection=before",
-    "current": "http://localhost:3000/cats?limit=5&sortBy=lastVetVisit:ASC&cursor=2022-12-20T10:00:00.000Z&cursorColumn=lastVetVisit&cursorDirection=after",
-    "next": "http://localhost:3000/cats?limit=5&sortBy=lastVetVisit:ASC&cursor=2022-12-25T10:00:00.000Z&cursorColumn=lastVetVisit&cursorDirection=after"
+    "previous": "http://localhost:3000/cats?limit=5&sortBy=lastVetVisit:DESC&cursor=V001671616800000",
+    "current": "http://localhost:3000/cats?limit=5&sortBy=lastVetVisit:ASC&cursor=V998328469600000",
+    "next": "http://localhost:3000/cats?limit=5&sortBy=lastVetVisit:ASC&cursor=V998328037600000"
   }
 }
 ```
@@ -220,7 +237,7 @@ export class CatsController {
 
 ### Config
 
-```ts
+````ts
 const paginateConfig: PaginateConfig<CatEntity> {
   /**
    * Required: true (must have a minimum of one column)
@@ -259,7 +276,17 @@ const paginateConfig: PaginateConfig<CatEntity> {
    * Default: None
    * Description: TypeORM partial selection. Limit selection further by using `select` query param.
    * https://typeorm.io/select-query-builder#partial-selection
-   * Note: You must include the primary key in the selection.
+   * Note: if you do not contain the primary key in the select array, primary key will be added automatically.
+   * 
+   * Wildcard support:
+   * - Use '*' to select all columns from the main entity.
+   * - Use 'relation.*' to select all columns from a relation.
+   * - Use 'relation.subrelation.*' to select all columns from nested relations.
+   * 
+   * Examples:
+   * select: ['*'] - Selects all columns from main entity
+   * select: ['id', 'name', 'toys.*'] - Selects id, name from main entity and all columns from toys relation
+   * select: ['*', 'toys.*'] - Selects all columns from both main entity and toys relation
    */
   select: ['id', 'name', 'color'],
 
@@ -297,17 +324,6 @@ const paginateConfig: PaginateConfig<CatEntity> {
 
   /**
    * Required: false
-   * Type: (keyof CatEntity)[]
-   * Default: None
-   * Description: Columns that can be used as cursors for cursor-based pagination.
-   * Typically used with date or unique & sequential columns like 'lastVetVisit' or 'id'.
-   * If `cursorColumn` is not provided in the query, the first column in this array is used as the default.
-   * If `cursorDirection` is not provided in the query, 'before' is used as the default direction.
-   */
-  cursorableColumns: ['lastVetVisit'],
-
-  /**
-   * Required: false
    * Type: RelationColumn<CatEntity>
    * Description: Indicates what relations of entity should be loaded.
    */
@@ -332,11 +348,17 @@ const paginateConfig: PaginateConfig<CatEntity> {
 
   /**
    * Required: false
+   * Type: boolean
+   * Description: Allows to specify withDeleted in query params to retrieve soft deleted records, convinient when you have archive functionality and some toggle to show or hide them. If not enabled explicitly the withDeleted query param will be ignored.
+   */
+  allowWithDeletedInQuery: false,
+
+  /**
+   * Required: false
    * Type: string
    * Description: Allow user to choose between limit/offset and take/skip, or cursor-based pagination.
    * Default: PaginationType.TAKE_AND_SKIP
    * Options: PaginationType.LIMIT_AND_OFFSET, PaginationType.TAKE_AND_SKIP, PaginationType.CURSOR
-   * Note: CURSOR requires `cursorableColumns` to be defined.
    *
    * However, using limit/offset can cause problems with relations.
    */
@@ -397,8 +419,31 @@ const paginateConfig: PaginateConfig<CatEntity> {
    * will be treated as a separate search term, allowing for more flexible matching.
    */
   multiWordSearch: false,
+
+  /**
+   * Required: false
+   * Type: (qb: SelectQueryBuilder<T>) => SelectQueryBuilder<any>
+   * Default: undefined
+   * Description: Callback that lets you override the COUNT query executed by
+   * paginate(). The function receives a **clone** of the original QueryBuilder,
+   * so it already contains every WHERE clause and parameter parsed by
+   * nestjs-paginate.
+   *
+   * Typical use-case: remove expensive LEFT JOINs or build a lighter DISTINCT
+   * count when getManyAndCount() becomes a bottleneck.
+   *
+   * Example:
+   * ```ts
+   * buildCountQuery: qb => {
+   *   qb.expressionMap.joinAttributes = [];   // drop all joins
+   *   qb.select('p.id').distinct(true);       // keep DISTINCT on primary key
+   *   return qb;                              // paginate() will call .getCount()
+   * }
+   * ```
+   */
+  buildCountQuery: (qb: SelectQueryBuilder<T>) => SelectQueryBuilder<any>,
 }
-```
+````
 
 ## Usage with Query Builder
 
@@ -477,6 +522,48 @@ const config: PaginateConfig<CatEntity> = {
 
 const result = await paginate<CatEntity>(query, catRepo, config)
 ```
+
+## Usage with to-many relationships
+
+You can filter parents by conditions on their to-many relations (one-to-many or many-to-many) using quantifiers.
+Quantifiers define how many related rows must satisfy the condition:
+
+- `$any` (default): at least one related row matches the condition
+- `$all`: all related rows match the condition
+- `$none`: no related rows match the condition
+
+### Examples
+Assume `CatEntity` has a one‑to‑many relation `toys: CatToyEntity[]` where `CatToyEntity` has a string column `name`.
+
+- At least one toy named exactly "Ball":
+
+  ```url
+  GET /cats?filter.toys.name=$any:$eq:Ball
+  ```
+
+- At least one toy whose name contains "red" (case-insensitive):
+
+  ```url
+  GET /cats?filter.toys.name=$any:$ilike:red
+  ```
+
+- All toys must have names that start with "Chew":
+
+  ```url
+  GET /cats?filter.toys.name=$all:$sw:Chew
+  ```
+
+- No toys named "Squeaky", including cats without any toys:
+
+  ```url
+  GET /cats?filter.toys.name=$none:$eq:Squeaky
+  ```
+
+- One or more toys not named "Squeaky":
+
+  ```url
+  GET /cats?filter.toys.name=$any:$not:$eq:Squeaky
+  ```
 
 ## Usage with Eager Loading
 
@@ -581,6 +668,38 @@ is resolved to:
 
 `WHERE ... AND (id = 5 OR id = 7) AND name = 'Milo' AND ...`
 
+## Cursor-based Pagination
+
+- `paginationType: PaginationType.CURSOR`
+- Cursor format:
+  - Numbers: `[prefix1][integer:11 digits][prefix2][decimal:4 digits]` (e.g., `Y00000000001V2500` for -1.25 in ASC).
+  - Dates: `[prefix][value:15 digits]` (e.g., `V001671444000000` for a timestamp in DESC).
+- Prefixes:
+  - `null`: `A` (lowest priority, last in results).
+  - ASC:
+    - positive-int: `V` (greater than or equal to 1), `X` (less than 1)
+    - positive-decimal: `V` (not zero), `X` (zero)
+    - zero-int: `X`
+    - zero-decimal: `X`
+    - negative-int: `Y`
+    - negative-decimal: `V`
+  - DESC:
+    - positive-int: `V`
+    - positive-decimal: `V`
+    - zero-int: `N`
+    - zero-decimal: `X`
+    - negative-int: `M` (less than or equal to -1), `N` (greater than -1)
+    - negative-decimal: `V` (not zero), `X` (zero)
+- Logic:
+  - Numbers: Split into integer (11 digits) and decimal (4 digits) parts, with separate prefixes. Supports negative values, with sorting adjusted per direction.
+  - Dates: Single prefix with 15-digit timestamp padded with zeros.
+  - ASC: Negative → Zero → Positive → Null.
+  - DESC: Positive → Zero → Negative → Null.
+- Notes:
+  - Multiple columns: `sortBy` can include multiple columns to create and sort by the cursor (e.g., `sortBy=age:ASC&sortBy=createdAt:DESC`), but at least one column must be unique to ensure consistent ordering.
+  - Supported columns: Cursor sorting is available for numeric and date-related columns (string columns are not supported).
+  - Decimal support: Numeric columns can include decimals, limited to 11 digits for the integer part and 4 digits for the decimal part.
+
 ## Swagger
 
 You can use two default decorators @ApiOkResponsePaginated and @ApiPagination to generate swagger documentation for your endpoints
@@ -616,6 +735,50 @@ There is also some syntax sugar for this, and you can use only one decorator `@P
 
   }
 ```
+
+It is also possible to customize a swagger UI completely or partially, by following the default implementation and creating your own version of PaginatedSwaggerDocs decorator
+
+Let's say you want some custom appearance for SortBy, you need to create a decorator for it
+
+```typescript
+export function CustomSortBy(paginationConfig: PaginateConfig<any>) {
+  return ApiQuery({
+    name: 'sortBy',
+    isArray: true,
+    description: `My custom sort by description`,
+    required: false,
+    type: 'string',
+  })
+}
+```
+
+Now you can create your version of the whole docs decorator and use it
+
+```typescript
+
+const CustomApiPaginationQuery = (paginationConfig: PaginateConfig<any>) => {
+  return applyDecorators(
+    ...[
+      Page(),
+      Limit(paginationConfig),
+      Where(paginationConfig),
+      CustomSortBy(paginationConfig),
+      Search(paginationConfig),
+      SearchBy(paginationConfig),
+      Select(paginationConfig),
+    ].filter((v): v is MethodDecorator => v !== undefined)
+  )
+}
+
+function CustomPaginatedSwaggerDocs<DTO extends Type<unknown>>(dto: DTO, paginatedConfig: PaginateConfig<any>) {
+  return applyDecorators(ApiOkPaginatedResponse(dto, paginatedConfig), CustomApiPaginationQuery(paginatedConfig))
+}
+
+```
+
+You can use CustomPaginatedSwaggerDocs instead of default PaginatedSwaggerDocs
+
+
 
 ## Troubleshooting
 

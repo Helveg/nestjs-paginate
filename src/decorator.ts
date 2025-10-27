@@ -2,6 +2,7 @@ import { createParamDecorator, ExecutionContext } from '@nestjs/common'
 import type { Request as ExpressRequest } from 'express'
 import type { FastifyRequest } from 'fastify'
 import { Dictionary, isString, mapKeys, pickBy } from 'lodash'
+import { isNil } from './helper'
 
 function isRecord(data: unknown): data is Record<string, unknown> {
     return data !== null && typeof data === 'object' && !Array.isArray(data)
@@ -20,8 +21,7 @@ export interface PaginateQuery {
     filter?: { [column: string]: string | string[] }
     select?: string[]
     cursor?: string
-    cursorColumn?: string
-    cursorDirection?: 'before' | 'after'
+    withDeleted?: boolean
     path: string
 }
 
@@ -50,6 +50,19 @@ function parseParam<T>(queryParam: unknown, parserLogic: (param: string, res: an
         }
     }
     return res.length ? res : undefined
+}
+
+function parseIntParam(v: unknown): number | undefined {
+    if (isNil(v)) {
+        return undefined
+    }
+
+    const result = Number.parseInt(v.toString(), 10)
+
+    if (Number.isNaN(result)) {
+        return undefined
+    }
+    return result
 }
 
 export const Paginate = createParamDecorator((_data: unknown, ctx: ExecutionContext): PaginateQuery => {
@@ -97,17 +110,15 @@ export const Paginate = createParamDecorator((_data: unknown, ctx: ExecutionCont
     )
 
     return {
-        page: query.page ? parseInt(query.page.toString(), 10) : undefined,
-        limit: query.limit ? parseInt(query.limit.toString(), 10) : undefined,
+        page: parseIntParam(query.page),
+        limit: parseIntParam(query.limit),
         sortBy,
         search: query.search ? query.search.toString() : undefined,
         searchBy,
         filter: Object.keys(filter).length ? filter : undefined,
         select,
         cursor: query.cursor ? query.cursor.toString() : undefined,
-        cursorColumn: query.cursorColumn ? query.cursorColumn.toString() : undefined,
-        cursorDirection:
-            query.cursorDirection === 'after' || query.cursorDirection === 'before' ? query.cursorDirection : undefined,
+        withDeleted: query.withDeleted === 'true' ? true : query.withDeleted === 'false' ? false : undefined,
         path,
     }
 })

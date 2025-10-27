@@ -1,10 +1,18 @@
 import { Logger, ServiceUnavailableException } from '@nestjs/common'
 import { mapKeys } from 'lodash'
 import { stringify } from 'querystring'
-import { Brackets, FindOptionsUtils, FindOptionsWhere, ObjectLiteral, Repository, SelectQueryBuilder } from 'typeorm'
+import {
+    Brackets,
+    EntityMetadata,
+    FindOptionsUtils,
+    FindOptionsWhere,
+    ObjectLiteral,
+    Repository,
+    SelectQueryBuilder,
+} from 'typeorm'
 import { WherePredicateOperator } from 'typeorm/query-builder/WhereClause'
 import { PaginateQuery } from './decorator'
-import { addFilter, FilterOperator, FilterSuffix } from './filter'
+import { addFilter, FilterOperator, FilterQuantifier, FilterSuffix } from './filter'
 import {
     checkIsEmbedded,
     checkIsRelation,
@@ -12,22 +20,28 @@ import {
     createRelationSchema,
     extractVirtualProperty,
     fixColumnAlias,
+    getMissingPrimaryKeyColumns,
+    getPaddedExpr,
     getPropertiesByColumnName,
     getQueryUrlComponents,
-    includesAllPrimaryKeyColumns,
+    isDateColumnType,
     isEntityKey,
     isFindOperator,
     isISODate,
+    isNil,
+    isNotNil,
     isRepository,
     JoinMethod,
     MappedColumns,
     mergeRelationSchema,
     Order,
     positiveNumberOrDefault,
+    quoteVirtualColumn,
     RelationSchema,
     RelationSchemaInput,
     SortBy,
 } from './helper'
+import globalConfig from './global-config'
 
 const logger: Logger = new Logger('nestjs-paginate')
 
@@ -47,9 +61,7 @@ export class Paginated<T> {
         filter?: {
             [column: string]: string | string[]
         }
-        cursor?: string // current cursor
-        firstCursor?: string // the first of the boundary values
-        lastCursor?: string // the last of the boundary values
+        cursor?: string
     }
     links: {
         first?: string
@@ -79,9 +91,10 @@ export interface PaginateConfig<T> {
     defaultSortBy?: SortBy<T>
     defaultLimit?: number
     where?: FindOptionsWhere<T> | FindOptionsWhere<T>[]
-    filterableColumns?: Partial<MappedColumns<T, (FilterOperator | FilterSuffix)[] | true>>
+    filterableColumns?: Partial<MappedColumns<T, (FilterOperator | FilterSuffix | FilterQuantifier)[] | true>>
     loadEagerRelations?: boolean
     withDeleted?: boolean
+    allowWithDeletedInQuery?: boolean
     paginationType?: PaginationType
     relativePath?: boolean
     origin?: string
@@ -90,14 +103,12 @@ export interface PaginateConfig<T> {
     multiWordSearch?: boolean
     defaultJoinMethod?: JoinMethod
     joinMethods?: Partial<MappedColumns<T, JoinMethod>>
-    cursorableColumns?: Column<T>[]
+    buildCountQuery?: (qb: SelectQueryBuilder<T>) => SelectQueryBuilder<any>
 }
 
 export enum PaginationLimit {
     NO_PAGINATION = -1,
     COUNTER_ONLY = 0,
-    DEFAULT_LIMIT = 20,
-    DEFAULT_MAX_LIMIT = 100,
 }
 
 function generateWhereStatement<T>(
@@ -181,7 +192,7 @@ function flattenWhereAndTransform<T>(
     })
 }
 
-function fixCursorValue(value: string): any {
+function fixCursorValue(value: any): any {
     if (isISODate(value)) {
         return new Date(value)
     }
@@ -193,10 +204,14 @@ export async function paginate<T extends ObjectLiteral>(
     repo: Repository<T> | SelectQueryBuilder<T>,
     config: PaginateConfig<T>
 ): Promise<Paginated<T>> {
+    const dbType = (isRepository(repo) ? repo.manager : repo).connection.options.type
+    const isMySqlOrMariaDb = ['mysql', 'mariadb'].includes(dbType)
+    const metadata = isRepository(repo) ? repo.metadata : repo.expressionMap.mainAlias.metadata
+
     const page = positiveNumberOrDefault(query.page, 1, 1)
 
-    const defaultLimit = config.defaultLimit || PaginationLimit.DEFAULT_LIMIT
-    const maxLimit = config.maxLimit || PaginationLimit.DEFAULT_MAX_LIMIT
+    const defaultLimit = config.defaultLimit || globalConfig.defaultLimit
+    const maxLimit = config.maxLimit || globalConfig.defaultMaxLimit
 
     const isPaginated = !(
         query.limit === PaginationLimit.COUNTER_ONLY ||
@@ -214,12 +229,233 @@ export async function paginate<T extends ObjectLiteral>(
                 : Math.min(query.limit ?? defaultLimit, maxLimit)
             : defaultLimit
 
+    const generateNullCursor = (): string => {
+        return 'A' + '0'.repeat(15) // null values ​​should be looked up last, so use the smallest prefix
+    }
+
+    const generateDateCursor = (value: number, direction: 'ASC' | 'DESC'): string => {
+        if (direction === 'ASC' && value === 0) {
+            return 'X' + '0'.repeat(15)
+        }
+
+        const finalValue = direction === 'ASC' ? Math.pow(10, 15) - value : value
+
+        return 'V' + String(finalValue).padStart(15, '0')
+    }
+
+    const generateNumberCursor = (value: number, direction: 'ASC' | 'DESC'): string => {
+        const integerLength = 11
+        const decimalLength = 4 // sorting is not possible if the decimal point exceeds 4 digits
+        const maxIntegerDigit = Math.pow(10, integerLength)
+        const fixedScale = Math.pow(10, decimalLength)
+        const absValue = Math.abs(value)
+        const scaledValue = Math.round(absValue * fixedScale)
+        const integerPart = Math.floor(scaledValue / fixedScale)
+        const decimalPart = scaledValue % fixedScale
+
+        let integerPrefix: string
+        let decimalPrefix: string
+        let finalInteger: number
+        let finalDecimal: number
+
+        if (direction === 'ASC') {
+            if (value < 0) {
+                integerPrefix = 'Y'
+                decimalPrefix = 'V'
+                finalInteger = integerPart
+                finalDecimal = decimalPart
+            } else if (value === 0) {
+                integerPrefix = 'X'
+                decimalPrefix = 'X'
+                finalInteger = 0
+                finalDecimal = 0
+            } else {
+                integerPrefix = integerPart === 0 ? 'X' : 'V' // X > V
+                decimalPrefix = decimalPart === 0 ? 'X' : 'V' // X > V
+                finalInteger = integerPart === 0 ? 0 : maxIntegerDigit - integerPart
+                finalDecimal = decimalPart === 0 ? 0 : fixedScale - decimalPart
+            }
+        } else {
+            // DESC
+            if (value < 0) {
+                integerPrefix = integerPart === 0 ? 'N' : 'M' // N > M
+                decimalPrefix = decimalPart === 0 ? 'X' : 'V' // X > V
+                finalInteger = integerPart === 0 ? 0 : maxIntegerDigit - integerPart
+                finalDecimal = decimalPart === 0 ? 0 : fixedScale - decimalPart
+            } else if (value === 0) {
+                integerPrefix = 'N'
+                decimalPrefix = 'X'
+                finalInteger = 0
+                finalDecimal = 0
+            } else {
+                integerPrefix = 'V'
+                decimalPrefix = 'V'
+                finalInteger = integerPart
+                finalDecimal = decimalPart
+            }
+        }
+
+        return (
+            integerPrefix +
+            String(finalInteger).padStart(integerLength, '0') +
+            decimalPrefix +
+            String(finalDecimal).padStart(decimalLength, '0')
+        )
+    }
+
+    const generateCursor = (item: T, sortBy: SortBy<T>, linkType: 'previous' | 'next' = 'next'): string => {
+        return sortBy
+            .map(([column, direction]) => {
+                const columnProperties = getPropertiesByColumnName(String(column))
+
+                let propertyPath = []
+                if (columnProperties.isNested) {
+                    if (columnProperties.propertyPath) {
+                        propertyPath.push(columnProperties.propertyPath)
+                    }
+                    propertyPath = propertyPath.concat(columnProperties.propertyName.split('.'))
+                } else if (columnProperties.propertyPath) {
+                    propertyPath = [columnProperties.propertyPath, columnProperties.propertyName]
+                } else {
+                    propertyPath = [columnProperties.propertyName]
+                }
+
+                // Extract value from nested object
+                let value = item
+                for (let i = 0; i < propertyPath.length; i++) {
+                    const key = propertyPath[i]
+
+                    if (value === null || value === undefined) {
+                        value = null
+                        break
+                    }
+
+                    // Handle case where value is an array
+                    if (Array.isArray(value[key])) {
+                        const arrayValues = value[key]
+                            .map((item: any) => {
+                                let nestedValue = item
+                                for (let j = i + 1; j < propertyPath.length; j++) {
+                                    if (nestedValue === null || nestedValue === undefined) {
+                                        return null
+                                    }
+
+                                    // Handle embedded properties
+                                    if (propertyPath[j].includes('.')) {
+                                        const nestedProperties = propertyPath[j].split('.')
+                                        for (const nestedProperty of nestedProperties) {
+                                            nestedValue = nestedValue[nestedProperty]
+                                        }
+                                    } else {
+                                        nestedValue = nestedValue[propertyPath[j]]
+                                    }
+                                }
+                                return nestedValue
+                            })
+                            .filter((v: any) => v !== null && v !== undefined)
+
+                        if (arrayValues.length === 0) {
+                            value = null
+                        } else {
+                            // Select min or max value based on sort direction and linkType (XOR)
+                            value = (
+                                (direction === 'ASC') !== (linkType === 'previous')
+                                    ? Math.min(...arrayValues)
+                                    : Math.max(...arrayValues)
+                            ) as any
+                        }
+                        break
+                    } else {
+                        value = value[key]
+                    }
+                }
+
+                value = fixCursorValue(value)
+
+                // Find column metadata
+                let columnMeta = null
+                if (propertyPath.length === 1) {
+                    // For regular column
+                    columnMeta = metadata.columns.find((col) => col.propertyName === columnProperties.propertyName)
+                } else {
+                    // For relation column
+                    let currentMetadata = metadata
+                    let currentPath = ''
+
+                    // Traverse the relation path except for the last part
+                    for (let i = 0; i < propertyPath.length - 1; i++) {
+                        const relationName = propertyPath[i]
+                        currentPath = currentPath ? `${currentPath}.${relationName}` : relationName
+                        const relation = currentMetadata.findRelationWithPropertyPath(relationName)
+
+                        if (relation) {
+                            currentMetadata = relation.inverseEntityMetadata
+                        } else {
+                            break
+                        }
+                    }
+
+                    // Find column by the last property name
+                    const propertyName = propertyPath[propertyPath.length - 1]
+                    columnMeta = currentMetadata.columns.find((col) => col.propertyName === propertyName)
+                }
+
+                const isDateColumn = columnMeta && isDateColumnType(columnMeta.type)
+
+                if (value === null || value === undefined) {
+                    return generateNullCursor()
+                }
+
+                if (isDateColumn) {
+                    return generateDateCursor(value.getTime(), direction)
+                } else {
+                    const numericValue = Number(value)
+                    return generateNumberCursor(numericValue, direction)
+                }
+            })
+            .join('')
+    }
+
+    const getDateColumnExpression = (alias: string, dbType: string): string => {
+        switch (dbType) {
+            case 'mysql':
+            case 'mariadb':
+                return `UNIX_TIMESTAMP(${alias}) * 1000`
+            case 'postgres':
+                return `EXTRACT(EPOCH FROM ${alias}) * 1000`
+            case 'sqlite':
+                return `(STRFTIME('%s', ${alias}) + (STRFTIME('%f', ${alias}) - STRFTIME('%S', ${alias}))) * 1000`
+            default:
+                return alias
+        }
+    }
+
+    const logAndThrowException = (msg: string) => {
+        logger.debug(msg)
+        throw new ServiceUnavailableException(msg)
+    }
+
+    if (config.sortableColumns.length < 1) {
+        logAndThrowException("Missing required 'sortableColumns' config.")
+    }
+
     const sortBy = [] as SortBy<T>
+
+    if (query.sortBy) {
+        for (const order of query.sortBy) {
+            if (isEntityKey(config.sortableColumns, order[0]) && ['ASC', 'DESC'].includes(order[1])) {
+                sortBy.push(order as Order<T>)
+            }
+        }
+    }
+
+    if (!sortBy.length) {
+        sortBy.push(...(config.defaultSortBy || [[config.sortableColumns[0], 'ASC']]))
+    }
+
     const searchBy: Column<T>[] = []
 
     let [items, totalItems]: [T[], number] = [[], 0]
-    let cursorColumn: string
-    let cursorDirection: 'before' | 'after'
 
     const queryBuilder = isRepository(repo) ? repo.createQueryBuilder('__root') : repo
 
@@ -229,51 +465,196 @@ export async function paginate<T extends ObjectLiteral>(
         }
     }
 
-    if (config.paginationType === PaginationType.CURSOR) {
-        const formatMessage = (msg: string) => {
-            logger.debug(msg)
-            throw new ServiceUnavailableException(msg)
-        }
-
-        if (!config.cursorableColumns?.length) {
-            formatMessage("Missing required 'cursorableColumns' config.")
-        }
-
-        cursorColumn = query.cursorColumn || config.cursorableColumns[0]
-        cursorDirection = query.cursorDirection || 'before'
-
-        if (!isEntityKey(config.cursorableColumns, cursorColumn)) {
-            formatMessage(
-                `Invalid cursorColumn '${cursorColumn}'. It must be one of: ${config.cursorableColumns.join(', ')}.`
-            )
-        }
-
-        if (!['before', 'after'].includes(cursorDirection)) {
-            formatMessage(`Invalid cursorDirection '${cursorDirection}'. It must be 'before' or 'after'.`)
-        }
-    }
-
     if (isPaginated) {
+        config.paginationType = config.paginationType || PaginationType.TAKE_AND_SKIP
+
         // Allow user to choose between limit/offset and take/skip, or cursor-based pagination.
         // However, using limit/offset can cause problems when joining one-to-many etc.
         if (config.paginationType === PaginationType.LIMIT_AND_OFFSET) {
             queryBuilder.limit(limit).offset((page - 1) * limit)
-        } else {
+        } else if (config.paginationType === PaginationType.TAKE_AND_SKIP) {
             queryBuilder.take(limit).skip((page - 1) * limit)
-        }
+        } else if (config.paginationType === PaginationType.CURSOR) {
+            queryBuilder.take(limit)
+            const padLength = 15
+            const integerLength = 11
+            const decimalLength = 4
+            const fixedScale = Math.pow(10, 4)
+            const maxIntegerDigit = Math.pow(10, 11)
 
-        if (config.paginationType === PaginationType.CURSOR && query.cursor) {
-            {
-                const columnProperties = getPropertiesByColumnName(cursorColumn)
-                const alias = fixColumnAlias(columnProperties, queryBuilder.alias)
-                const operator = cursorDirection === 'before' ? '<' : '>'
-                const cursorValue = fixCursorValue(query.cursor)
-                queryBuilder.andWhere(`${alias} ${operator} :cursor`, { cursor: cursorValue })
+            const concat = (parts: string[]): string =>
+                isMySqlOrMariaDb ? `CONCAT(${parts.join(', ')})` : parts.join(' || ')
+
+            const generateNullCursorExpr = (): string => {
+                const zeroPaddedExpr = getPaddedExpr('0', padLength, dbType)
+                const prefix = 'A'
+
+                return isMySqlOrMariaDb ? `CONCAT('${prefix}', ${zeroPaddedExpr})` : `'${prefix}' || ${zeroPaddedExpr}`
             }
+
+            const generateDateCursorExpr = (columnExpr: string, direction: 'ASC' | 'DESC'): string => {
+                const safeExpr = `COALESCE(${columnExpr}, 0)`
+                const sqlExpr = direction === 'ASC' ? `POW(10, ${padLength}) - ${safeExpr}` : safeExpr
+
+                const paddedExpr = getPaddedExpr(sqlExpr, padLength, dbType)
+                const zeroPaddedExpr = getPaddedExpr('0', padLength, dbType)
+
+                const prefixNull = "'A'"
+                const prefixValue = "'V'"
+                const prefixZero = "'X'"
+
+                if (direction === 'ASC') {
+                    return `CASE
+                        WHEN ${columnExpr} IS NULL THEN ${concat([prefixNull, zeroPaddedExpr])}
+                        WHEN ${columnExpr} = 0 THEN ${concat([prefixZero, zeroPaddedExpr])}
+                        ELSE ${concat([prefixValue, paddedExpr])}
+                    END`
+                } else {
+                    return `CASE
+                        WHEN ${columnExpr} IS NULL THEN ${concat([prefixNull, zeroPaddedExpr])}
+                        ELSE ${concat([prefixValue, paddedExpr])}
+                    END`
+                }
+            }
+
+            const generateNumberCursorExpr = (columnExpr: string, direction: 'ASC' | 'DESC'): string => {
+                const safeExpr = `COALESCE(${columnExpr}, 0)`
+                const absSafeExpr = `ABS(${safeExpr})`
+                const scaledExpr = `ROUND(${absSafeExpr} * ${fixedScale}, 0)`
+                const intExpr = `FLOOR(${scaledExpr} / ${fixedScale})`
+                const decExpr = `(${scaledExpr} % ${fixedScale})`
+                const reversedIntExpr = `(${maxIntegerDigit} - ${intExpr})`
+                const reversedDecExpr = `(${fixedScale} - ${decExpr})`
+
+                const paddedIntExpr = getPaddedExpr(intExpr, integerLength, dbType)
+                const paddedDecExpr = getPaddedExpr(decExpr, decimalLength, dbType)
+                const reversedIntPaddedExpr = getPaddedExpr(reversedIntExpr, integerLength, dbType)
+                const reversedDecPaddedExpr = getPaddedExpr(reversedDecExpr, decimalLength, dbType)
+                const zeroPaddedIntExpr = getPaddedExpr('0', integerLength, dbType)
+                const zeroPaddedDecExpr = getPaddedExpr('0', decimalLength, dbType)
+
+                if (direction === 'ASC') {
+                    return `CASE
+                        WHEN ${columnExpr} IS NULL THEN ${generateNullCursorExpr()}
+                        WHEN ${columnExpr} < 0 THEN ${concat(["'Y'", paddedIntExpr, "'V'", paddedDecExpr])}
+                        WHEN ${columnExpr} = 0 THEN ${concat(["'X'", zeroPaddedIntExpr, "'X'", zeroPaddedDecExpr])}
+                        WHEN ${columnExpr} > 0 AND ${intExpr} = 0 AND ${decExpr} > 0 THEN ${concat([
+                            "'X'",
+                            zeroPaddedIntExpr,
+                            "'V'",
+                            reversedDecPaddedExpr,
+                        ])}
+                        WHEN ${columnExpr} > 0 AND ${intExpr} > 0 AND ${decExpr} = 0 THEN ${concat([
+                            "'V'",
+                            reversedIntPaddedExpr,
+                            "'X'",
+                            zeroPaddedDecExpr,
+                        ])}
+                        WHEN ${columnExpr} > 0 AND ${intExpr} > 0 AND ${decExpr} > 0 THEN ${concat([
+                            "'V'",
+                            reversedIntPaddedExpr,
+                            "'V'",
+                            reversedDecPaddedExpr,
+                        ])}
+                    END`
+                } else {
+                    return `CASE
+                        WHEN ${columnExpr} IS NULL THEN ${generateNullCursorExpr()}
+                        WHEN ${columnExpr} < 0 AND ${intExpr} > 0 AND ${decExpr} > 0 THEN ${concat([
+                            "'M'",
+                            reversedIntPaddedExpr,
+                            "'V'",
+                            reversedDecPaddedExpr,
+                        ])}
+                        WHEN ${columnExpr} < 0 AND ${intExpr} > 0 AND ${decExpr} = 0 THEN ${concat([
+                            "'M'",
+                            reversedIntPaddedExpr,
+                            "'X'",
+                            zeroPaddedDecExpr,
+                        ])}
+                        WHEN ${columnExpr} < 0 AND ${intExpr} = 0 AND ${decExpr} > 0 THEN ${concat([
+                            "'N'",
+                            zeroPaddedIntExpr,
+                            "'V'",
+                            reversedDecPaddedExpr,
+                        ])}
+                        WHEN ${columnExpr} = 0 THEN ${concat(["'N'", zeroPaddedIntExpr, "'X'", zeroPaddedDecExpr])}
+                        WHEN ${columnExpr} > 0 THEN ${concat(["'V'", paddedIntExpr, "'V'", paddedDecExpr])}
+                    END`
+                }
+            }
+
+            const cursorExpressions = sortBy.map(([column, direction]) => {
+                const columnProperties = getPropertiesByColumnName(column)
+                const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(
+                    queryBuilder,
+                    columnProperties
+                )
+                const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
+                const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
+                const alias = fixColumnAlias(
+                    columnProperties,
+                    queryBuilder.alias,
+                    isRelation,
+                    isVirtualProperty,
+                    isEmbedded,
+                    virtualQuery
+                )
+
+                // Find column metadata to determine type for proper cursor handling
+                let columnMeta = metadata.columns.find((col) => col.propertyName === columnProperties.propertyName)
+
+                // If it's a relation column, we need to find the target column metadata
+                if (isRelation) {
+                    // Find the relation by path and get the target entity metadata
+                    const relationPath = columnProperties.column.split('.')
+                    // The base entity is the starting point
+                    let currentMetadata = metadata
+
+                    // Traverse the relation path to find the target metadata
+                    for (let i = 0; i < relationPath.length - 1; i++) {
+                        const relationName = relationPath[i]
+                        const relation = currentMetadata.findRelationWithPropertyPath(relationName)
+
+                        if (relation) {
+                            // Update the metadata to the target entity metadata for the next iteration
+                            currentMetadata = relation.inverseEntityMetadata
+                        } else {
+                            break
+                        }
+                    }
+
+                    // Now get the property from the target entity
+                    const propertyName = relationPath[relationPath.length - 1]
+                    columnMeta = currentMetadata.columns.find((col) => col.propertyName === propertyName)
+                }
+
+                // Determine whether it's a date column
+                const isDateColumn = columnMeta && isDateColumnType(columnMeta.type)
+                const columnExpr = isDateColumn ? getDateColumnExpression(alias, dbType) : alias
+
+                return isDateColumn
+                    ? generateDateCursorExpr(columnExpr, direction)
+                    : generateNumberCursorExpr(columnExpr, direction)
+            })
+
+            const cursorExpression =
+                cursorExpressions.length > 1
+                    ? isMySqlOrMariaDb
+                        ? `CONCAT(${cursorExpressions.join(', ')})`
+                        : cursorExpressions.join(' || ')
+                    : cursorExpressions[0]
+            queryBuilder.addSelect(cursorExpression, 'cursor')
+
+            if (query.cursor) {
+                queryBuilder.andWhere(`${cursorExpression} < :cursor`, { cursor: query.cursor })
+            }
+
+            isMySqlOrMariaDb ? queryBuilder.orderBy('`cursor`', 'DESC') : queryBuilder.orderBy('cursor', 'DESC') // since cursor is a reserved word in mysql, wrap it in backticks to recognize it as an alias
         }
     }
 
-    if (config.withDeleted) {
+    if (config.withDeleted || (config.allowWithDeletedInQuery && query.withDeleted)) {
         queryBuilder.withDeleted()
     }
 
@@ -290,84 +671,147 @@ export async function paginate<T extends ObjectLiteral>(
             createRelationSchema(config.relations),
             createRelationSchema(Object.keys(joinMethods))
         )
-        addRelationsFromSchema(queryBuilder, relationsSchema, config, joinMethods)
+        addRelationsFromSchema(queryBuilder, relationsSchema, joinMethods, config.defaultJoinMethod)
     }
 
-    const dbType = (isRepository(repo) ? repo.manager : repo).connection.options.type
-    const isMariaDbOrMySql = (dbType: string) => dbType === 'mariadb' || dbType === 'mysql'
-    const isMMDb = isMariaDbOrMySql(dbType)
-
-    let nullSort: string | undefined
-    if (config.nullSort) {
-        if (isMMDb) {
-            nullSort = config.nullSort === 'last' ? 'IS NULL' : 'IS NOT NULL'
-        } else {
-            nullSort = config.nullSort === 'last' ? 'NULLS LAST' : 'NULLS FIRST'
-        }
-    }
-
-    if (config.sortableColumns.length < 1) {
-        const message = "Missing required 'sortableColumns' config."
-        logger.debug(message)
-        throw new ServiceUnavailableException(message)
-    }
-
-    // If paginationType is cursor, add the cursor column and direction before adding other query.sortBy.
-    if (config.paginationType === PaginationType.CURSOR) {
-        sortBy.push([cursorColumn, cursorDirection === 'before' ? 'DESC' : 'ASC'] as Order<T>)
-    }
-
-    if (query.sortBy) {
-        for (const order of query.sortBy) {
-            if (isEntityKey(config.sortableColumns, order[0]) && ['ASC', 'DESC'].includes(order[1])) {
-                sortBy.push(order as Order<T>)
+    if (config.paginationType !== PaginationType.CURSOR) {
+        let nullSort: string | undefined
+        if (config.nullSort) {
+            if (isMySqlOrMariaDb) {
+                nullSort = config.nullSort === 'last' ? 'IS NULL' : 'IS NOT NULL'
+            } else {
+                nullSort = config.nullSort === 'last' ? 'NULLS LAST' : 'NULLS FIRST'
             }
         }
-    }
 
-    if (!sortBy.length) {
-        sortBy.push(...(config.defaultSortBy || [[config.sortableColumns[0], 'ASC']]))
-    }
+        for (const order of sortBy) {
+            const columnProperties = getPropertiesByColumnName(order[0])
+            const { isVirtualProperty } = extractVirtualProperty(queryBuilder, columnProperties)
+            const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
+            const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
+            let alias = fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, isVirtualProperty, isEmbedded)
 
-    for (const order of sortBy) {
-        const columnProperties = getPropertiesByColumnName(order[0])
-        const { isVirtualProperty } = extractVirtualProperty(queryBuilder, columnProperties)
-        const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
-        const isEmbeded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
-        let alias = fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, isVirtualProperty, isEmbeded)
-
-        if (isMMDb) {
             if (isVirtualProperty) {
-                alias = `\`${alias}\``
+                alias = quoteVirtualColumn(alias, isMySqlOrMariaDb)
             }
-            if (nullSort) {
-                queryBuilder.addOrderBy(`${alias} ${nullSort}`)
+
+            if (isMySqlOrMariaDb) {
+                if (nullSort) {
+                    const selectionAliasName = `${alias.replace(/\./g, '_')}IsNull`
+                    queryBuilder.addSelect(`${alias} ${nullSort}`, selectionAliasName)
+                    queryBuilder.addOrderBy(selectionAliasName)
+                }
+                queryBuilder.addOrderBy(alias, order[1])
+            } else {
+                queryBuilder.addOrderBy(alias, order[1], nullSort as 'NULLS FIRST' | 'NULLS LAST' | undefined)
             }
-            queryBuilder.addOrderBy(alias, order[1])
-        } else {
-            if (isVirtualProperty) {
-                alias = `"${alias}"`
-            }
-            queryBuilder.addOrderBy(alias, order[1], nullSort as 'NULLS FIRST' | 'NULLS LAST' | undefined)
         }
     }
 
-    // When we partial select the columns (main or relation) we must add the primary key column otherwise
-    // typeorm will not be able to map the result.
-    let selectParams =
-        config.select && query.select && !config.ignoreSelectInQueryParam
-            ? config.select.filter((column) => query.select.includes(column))
-            : config.select
-    if (!includesAllPrimaryKeyColumns(queryBuilder, query.select)) {
-        selectParams = config.select
+    /**
+     * Expands select parameters containing wildcards (*) into actual column lists
+     *
+     * @returns Array of expanded column names
+     */
+    const expandWildcardSelect = <T>(selectParams: string[], queryBuilder: SelectQueryBuilder<T>): string[] => {
+        const expandedParams: string[] = []
+
+        const mainAlias = queryBuilder.expressionMap.mainAlias
+        const mainMetadata = mainAlias.metadata
+
+        /**
+         * Internal function to expand wildcards
+         *
+         * @returns Array of expanded column names
+         */
+        const _expandWidcard = (entityPath: string, metadata: EntityMetadata): string[] => {
+            const expanded: string[] = []
+
+            // Add all columns from the relation entity
+            expanded.push(
+                ...metadata.columns
+                    .filter(
+                        (col) =>
+                            !metadata.embeddeds
+                                .map((embedded) => embedded.columns.map((embeddedCol) => embeddedCol.propertyName))
+                                .flat()
+                                .includes(col.propertyName)
+                    )
+                    .map((col) => (entityPath ? `${entityPath}.${col.propertyName}` : col.propertyName))
+            )
+
+            // Add columns from embedded entities in the relation
+            metadata.embeddeds.forEach((embedded) => {
+                expanded.push(
+                    ...embedded.columns.map((col) => `${entityPath}.(${embedded.propertyName}.${col.propertyName})`)
+                )
+            })
+
+            return expanded
+        }
+
+        for (const param of selectParams) {
+            if (param === '*') {
+                expandedParams.push(..._expandWidcard('', mainMetadata))
+            } else if (param.endsWith('.*')) {
+                // Handle relation entity wildcards (e.g. 'user.*', 'user.profile.*')
+                const parts = param.slice(0, -2).split('.')
+                let currentPath = ''
+                let currentMetadata = mainMetadata
+
+                for (let i = 0; i < parts.length; i++) {
+                    const part = parts[i]
+                    currentPath = currentPath ? `${currentPath}.${part}` : part
+                    const relation = currentMetadata.findRelationWithPropertyPath(part)
+
+                    if (relation) {
+                        currentMetadata = relation.inverseEntityMetadata
+                        if (i === parts.length - 1) {
+                            // Expand wildcard at the last part
+                            expandedParams.push(..._expandWidcard(currentPath, currentMetadata))
+                        }
+                    } else {
+                        break
+                    }
+                }
+            } else {
+                // Add regular columns as is
+                expandedParams.push(param)
+            }
+        }
+
+        // Remove duplicates while preserving order
+        return [...new Set(expandedParams)]
     }
-    if (selectParams?.length > 0 && includesAllPrimaryKeyColumns(queryBuilder, selectParams)) {
-        const cols: string[] = selectParams.reduce((cols, currentCol) => {
+
+    const selectParams = (() => {
+        // Expand wildcards in config.select if it exists
+        const expandedConfigSelect = config.select ? expandWildcardSelect(config.select, queryBuilder) : undefined
+
+        // Expand wildcards in query.select if it exists
+        const expandedQuerySelect = query.select ? expandWildcardSelect(query.select, queryBuilder) : undefined
+
+        // Filter config.select with expanded query.select if both exist and ignoreSelectInQueryParam is false
+        if (expandedConfigSelect && expandedQuerySelect && !config.ignoreSelectInQueryParam) {
+            return expandedConfigSelect.filter((column) => expandedQuerySelect.includes(column))
+        }
+
+        return expandedConfigSelect
+    })()
+
+    if (selectParams?.length > 0) {
+        let cols: string[] = selectParams.reduce((cols, currentCol) => {
             const columnProperties = getPropertiesByColumnName(currentCol)
             const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
             cols.push(fixColumnAlias(columnProperties, queryBuilder.alias, isRelation))
             return cols
         }, [])
+
+        const missingPrimaryKeys = getMissingPrimaryKeyColumns(queryBuilder, cols)
+        if (missingPrimaryKeys.length > 0) {
+            cols = cols.concat(missingPrimaryKeys)
+        }
+
         queryBuilder.select(cols)
     }
 
@@ -469,27 +913,14 @@ export async function paginate<T extends ObjectLiteral>(
     if (query.limit === PaginationLimit.COUNTER_ONLY) {
         totalItems = await queryBuilder.getCount()
     } else if (isPaginated && config.paginationType !== PaginationType.CURSOR) {
-        ;[items, totalItems] = await queryBuilder.getManyAndCount()
+        if (config.buildCountQuery) {
+            items = await queryBuilder.getMany()
+            totalItems = await config.buildCountQuery(queryBuilder.clone()).getCount()
+        } else {
+            ;[items, totalItems] = await queryBuilder.getManyAndCount()
+        }
     } else {
         items = await queryBuilder.getMany()
-    }
-
-    let firstCursor: string | undefined
-    let lastCursor: string | undefined
-
-    if (config.paginationType === PaginationType.CURSOR && items.length > 0) {
-        const cursorValueToString = (value: any): string | undefined => {
-            if (value === null || value === undefined) {
-                return undefined
-            }
-            if (value instanceof Date) {
-                return value.toISOString()
-            }
-            return String(value)
-        }
-
-        firstCursor = cursorValueToString(items[0][cursorColumn])
-        lastCursor = cursorValueToString(items[items.length - 1][cursorColumn])
     }
 
     const sortByQuery = sortBy.map((order) => `&sortBy=${order.join(':')}`).join('')
@@ -522,37 +953,27 @@ export async function paginate<T extends ObjectLiteral>(
         const { queryOrigin, queryPath } = getQueryUrlComponents(query.path)
         if (config.relativePath) {
             path = queryPath
-        } else if (config.origin) {
+        } else if (isNotNil(config.origin)) {
             path = config.origin + queryPath
         } else {
-            path = queryOrigin + queryPath
+            path = (isNil(globalConfig.defaultOrigin) ? queryOrigin : globalConfig.defaultOrigin) + queryPath
         }
     }
-    const buildLink = (p: number | string, isCursor: boolean = false, isReversed: boolean = false): string => {
-        if (isCursor) {
-            let adjustedOptions = options
 
-            if (isReversed) {
-                // Reverse ASC/DESC of first sortBy
-                const match = options.match(/sortBy=([^&]+)/) // Match 'sortBy=' value and extract the part after ':'
+    const buildLink = (p: number): string => path + '?page=' + p + options
 
-                if (match) {
-                    const fullSortBy = match[0]
-                    const [column, order] = match[1].split(':')
-                    const newOrder = order === 'ASC' ? 'DESC' : 'ASC'
-                    adjustedOptions = options.replace(fullSortBy, `sortBy=${column}:${newOrder}`)
-                }
-            }
+    const reversedSortBy = sortBy.map(([col, dir]) => [col, dir === 'ASC' ? 'DESC' : 'ASC'] as Order<T>)
 
-            return (
-                path +
-                adjustedOptions.replace(/^./, '?') +
-                `&${p ? 'cursor=' + p : ''}&cursorColumn=${cursorColumn}&cursorDirection=${
-                    isReversed ? (cursorDirection === 'before' ? 'after' : 'before') : cursorDirection
-                }`
-            )
+    const buildLinkForCursor = (cursor: string | undefined, isReversed: boolean = false): string => {
+        let adjustedOptions = options
+
+        if (isReversed && sortBy.length > 0) {
+            adjustedOptions = `&limit=${limit}${reversedSortBy
+                .map((order) => `&sortBy=${order.join(':')}`)
+                .join('')}${searchQuery}${searchByQuery}${selectQuery}${filterQuery}`
         }
-        return path + '?page=' + p + options
+
+        return path + adjustedOptions.replace(/^./, '?') + (cursor ? `&cursor=${cursor}` : '')
     }
 
     const itemsPerPage = limit === PaginationLimit.COUNTER_ONLY ? totalItems : isPaginated ? limit : items.length
@@ -572,17 +993,19 @@ export async function paginate<T extends ObjectLiteral>(
             select: isQuerySelected ? selectParams : undefined,
             filter: query.filter,
             cursor: config.paginationType === PaginationType.CURSOR ? query.cursor : undefined,
-            firstCursor: config.paginationType === PaginationType.CURSOR ? firstCursor : undefined,
-            lastCursor: config.paginationType === PaginationType.CURSOR ? lastCursor : undefined,
         },
         // If there is no `path`, don't build links.
         links:
             path !== null
                 ? config.paginationType === PaginationType.CURSOR
                     ? {
-                          previous: query.cursor && items.length ? buildLink(firstCursor, true, true) : undefined, // If no data exists, firstCursor is missing, so "previous" link is undefined.
-                          current: query.cursor ? buildLink(query.cursor, true) : buildLink('', true),
-                          next: lastCursor ? buildLink(lastCursor, true) : undefined,
+                          previous: items.length
+                              ? buildLinkForCursor(generateCursor(items[0], reversedSortBy, 'previous'), true)
+                              : undefined,
+                          current: buildLinkForCursor(query.cursor),
+                          next: items.length
+                              ? buildLinkForCursor(generateCursor(items[items.length - 1], sortBy))
+                              : undefined,
                       }
                     : {
                           first: page == 1 ? undefined : buildLink(1),
@@ -600,11 +1023,9 @@ export async function paginate<T extends ObjectLiteral>(
 export function addRelationsFromSchema<T>(
     queryBuilder: SelectQueryBuilder<T>,
     schema: RelationSchema<T>,
-    config: PaginateConfig<T>,
-    joinMethods: Partial<MappedColumns<T, JoinMethod>>
+    joinMethods: Partial<MappedColumns<T, JoinMethod>>,
+    defaultJoinMethod: 'leftJoin' | 'innerJoin' | 'leftJoinAndSelect' | 'innerJoinAndSelect' = 'leftJoinAndSelect'
 ): void {
-    const defaultJoinMethod = config.defaultJoinMethod ?? 'leftJoinAndSelect'
-
     const createQueryBuilderRelations = (
         prefix: string,
         relations: RelationSchema,

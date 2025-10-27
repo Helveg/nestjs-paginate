@@ -153,6 +153,30 @@ export function includesAllPrimaryKeyColumns(qb: SelectQueryBuilder<unknown>, pr
         .every((column) => propertyPath.includes(column))
 }
 
+export function getPrimaryKeyColumns(qb: SelectQueryBuilder<any>, entityName?: string): string[] {
+    return qb.expressionMap.mainAlias?.metadata?.primaryColumns.map((column) =>
+        entityName ? `${entityName}.${column.propertyName}` : column.propertyName
+    )
+}
+
+export function getMissingPrimaryKeyColumns(qb: SelectQueryBuilder<any>, transformedCols: string[]): string[] {
+    if (!transformedCols || transformedCols.length === 0) return []
+
+    const mainEntityPrimaryKeys = getPrimaryKeyColumns(qb)
+    const missingPrimaryKeys: string[] = []
+
+    for (const pk of mainEntityPrimaryKeys) {
+        const columnProperties = getPropertiesByColumnName(pk)
+        const pkAlias = fixColumnAlias(columnProperties, qb.alias, false)
+
+        if (!transformedCols.includes(pkAlias)) {
+            missingPrimaryKeys.push(pkAlias)
+        }
+    }
+
+    return missingPrimaryKeys
+}
+
 export function hasColumnWithPropertyPath(
     qb: SelectQueryBuilder<unknown>,
     columnProperties: ColumnProperties
@@ -192,7 +216,7 @@ export function checkIsOneOfNestedPrimaryColumns(qb: SelectQueryBuilder<unknown>
         }
         metadata = relation.inverseEntityMetadata
     }
-    return !!metadata.primaryColumns.find(col => col.propertyName === deepestProperty)
+    return !!metadata.primaryColumns.find((col) => col.propertyName === deepestProperty)
 }
 
 export function checkIsEmbedded(qb: SelectQueryBuilder<unknown>, propertyPath: string): boolean {
@@ -314,4 +338,75 @@ export function createRelationSchema<T>(configurationRelations: RelationSchemaIn
 export function mergeRelationSchema(...schemas: RelationSchema[]) {
     const noTrueOverride = (obj, source) => (source === true && obj !== undefined ? obj : undefined)
     return mergeWith({}, ...schemas, noTrueOverride)
+}
+
+export function getPaddedExpr(valueExpr: string, length: number, dbType: string): string {
+    const lengthStr = String(length)
+    if (dbType === 'postgres' || dbType === 'cockroachdb') {
+        return `LPAD((${valueExpr})::bigint::text, ${lengthStr}, '0')`
+    } else if (dbType === 'mysql' || dbType === 'mariadb') {
+        return `LPAD(${valueExpr}, ${lengthStr}, '0')`
+    } else {
+        // sqlite
+        const padding = '0'.repeat(length)
+        return `SUBSTR('${padding}' || CAST(${valueExpr} AS INTEGER), -${lengthStr}, ${lengthStr})`
+    }
+}
+
+export function isDateColumnType(type: any): boolean {
+    const dateTypes = [
+        Date, // JavaScript Date class
+        'datetime',
+        'timestamp',
+        'timestamptz',
+    ]
+    return dateTypes.includes(type)
+}
+
+export function quoteVirtualColumn(columnName: string, isMySqlOrMariaDb: boolean): string {
+    return isMySqlOrMariaDb ? `\`${columnName}\`` : `"${columnName}"`
+}
+
+export function isNil(v: unknown): boolean {
+    return v === null || v === undefined
+}
+
+export function isNotNil(v: unknown): boolean {
+    return !isNil(v)
+}
+
+export function andWhereNoneExist(
+    qb: SelectQueryBuilder<any>,
+    existsQb: SelectQueryBuilder<any>
+): SelectQueryBuilder<any> {
+    const [query, params] = qb['getExistsCondition'](existsQb)
+    return qb.andWhere(`NOT ${query}`, params)
+}
+
+/**
+ * Adds a condition to the query builder that ensures all related entities match the given filter criteria.
+ *
+ * This method combines two conditions:
+ * 1. EXISTS(X) - There must be at least one related entity matching the criteria
+ * 2. NOT EXISTS(NOT X) - There must not be any related entities that don't match the criteria
+ *
+ * Together, these conditions ensure that all related entities match the filter criteria X.
+ * For example, when filtering pillows in a cat home, this could find homes where ALL pillows are red.
+ *
+ * If you need to include cases where there are either 0 or all entities match, use $none:$not:X instead.
+ *
+ * @param {SelectQueryBuilder<any>} qb The main query builder instance to add the condition to.
+ * @param {SelectQueryBuilder<any>} existsQb The subquery builder containing the filter criteria.
+ * @return {SelectQueryBuilder<any>} The modified query builder with the combined EXISTS conditions.
+ */
+export function andWhereAllExist(
+    qb: SelectQueryBuilder<any>,
+    existsQb: SelectQueryBuilder<any>
+): SelectQueryBuilder<any> {
+    qb = qb.andWhereExists(existsQb)
+    const [query, params] = qb['getExistsCondition'](existsQb)
+    // The getExistsCondition clears anything that comes after WHERE, and our joining logic does not contain WHERE,
+    // so it should be safe to replace the first WHERE with WHERE NOT (...) and get a correct query.
+    const existsWhereNot = query.replace('WHERE', 'WHERE NOT (') + ')'
+    return qb.andWhere(`NOT ${existsWhereNot}`, params)
 }

@@ -109,8 +109,7 @@ describe('Decorator', () => {
             filter: undefined,
             select: undefined,
             cursor: undefined,
-            cursorColumn: undefined,
-            cursorDirection: undefined,
+            withDeleted: undefined,
             path: 'http://localhost/items',
         })
     })
@@ -129,8 +128,7 @@ describe('Decorator', () => {
             filter: undefined,
             select: undefined,
             cursor: undefined,
-            cursorColumn: undefined,
-            cursorDirection: undefined,
+            withDeleted: undefined,
             path: 'http://localhost/items',
         })
     })
@@ -141,12 +139,11 @@ describe('Decorator', () => {
             limit: '20',
             sortBy: ['id:ASC', 'createdAt:DESC'],
             search: 'white',
+            withDeleted: 'true',
             'filter.name': '$not:$eq:Kitty',
             'filter.createdAt': ['$gte:2020-01-01', '$lte:2020-12-31'],
             select: ['name', 'createdAt'],
             cursor: 'abc123',
-            cursorColumn: 'id',
-            cursorDirection: 'after',
         })
 
         const result: PaginateQuery = decoratorfactory(null, context)
@@ -160,6 +157,7 @@ describe('Decorator', () => {
             ],
             search: 'white',
             searchBy: undefined,
+            withDeleted: true,
             select: ['name', 'createdAt'],
             path: 'http://localhost/items',
             filter: {
@@ -167,8 +165,6 @@ describe('Decorator', () => {
                 createdAt: ['$gte:2020-01-01', '$lte:2020-12-31'],
             },
             cursor: 'abc123',
-            cursorColumn: 'id',
-            cursorDirection: 'after',
         })
     })
 
@@ -178,12 +174,11 @@ describe('Decorator', () => {
             limit: '20',
             sortBy: ['id:ASC', 'createdAt:DESC'],
             search: 'white',
+            withDeleted: 'false',
             'filter.name': '$not:$eq:Kitty',
             'filter.createdAt': ['$gte:2020-01-01', '$lte:2020-12-31'],
             select: ['name', 'createdAt'],
             cursor: 'abc123',
-            cursorColumn: 'id',
-            cursorDirection: 'after',
         })
 
         const result: PaginateQuery = decoratorfactory(null, context)
@@ -197,6 +192,7 @@ describe('Decorator', () => {
             ],
             search: 'white',
             searchBy: undefined,
+            withDeleted: false,
             path: 'http://localhost/items',
             filter: {
                 name: '$not:$eq:Kitty',
@@ -204,8 +200,37 @@ describe('Decorator', () => {
             },
             select: ['name', 'createdAt'],
             cursor: 'abc123',
-            cursorColumn: 'id',
-            cursorDirection: 'after',
+        })
+    })
+
+    it('should use default params if not valid values provided', () => {
+        const context = fastifyContextFactory({
+            page: 'NOTANUMBER',
+            limit: 'NOTANUMBER',
+            sortBy: ['NOTEXISTEN:BLABLA'],
+            search: 'white',
+            'filter.notUsed': '$fake:$eqaa:Kitty',
+            'filter.notUsedSecond': 'something',
+            select: ['notExisted'],
+            cursor: 'abc123',
+        })
+
+        const result: PaginateQuery = decoratorfactory(null, context)
+
+        expect(result).toStrictEqual({
+            page: undefined,
+            limit: undefined,
+            sortBy: [['NOTEXISTEN', 'BLABLA']],
+            search: 'white',
+            searchBy: undefined,
+            withDeleted: undefined,
+            path: 'http://localhost/items',
+            filter: {
+                notUsed: '$fake:$eqaa:Kitty',
+                notUsedSecond: 'something',
+            },
+            select: ['notExisted'],
+            cursor: 'abc123',
         })
     })
 })

@@ -1,7 +1,7 @@
 import { HttpException, Logger } from '@nestjs/common'
 import { clone } from 'lodash'
 import * as process from 'process'
-import { DataSource, In, Like, Repository, TypeORMError } from 'typeorm'
+import { DataSource, In, Like, Repository, SelectQueryBuilder, TypeORMError } from 'typeorm'
 import { BaseDataSourceOptions } from 'typeorm/data-source/BaseDataSourceOptions'
 import { CatHairEntity } from './__tests__/cat-hair.entity'
 import { CatHomePillowBrandEntity } from './__tests__/cat-home-pillow-brand.entity'
@@ -15,6 +15,7 @@ import { PaginateQuery } from './decorator'
 import {
     FilterComparator,
     FilterOperator,
+    FilterQuantifier,
     FilterSuffix,
     isOperator,
     isSuffix,
@@ -22,6 +23,7 @@ import {
     parseFilterToken,
 } from './filter'
 import { paginate, PaginateConfig, Paginated, PaginationLimit, PaginationType } from './paginate'
+import globalConfig, { updateGlobalConfig } from './global-config'
 import 'dotenv/config'
 
 // Disable debug logs during tests
@@ -124,6 +126,7 @@ describe('paginate', () => {
                 cutenessLevel: CutenessLevel.HIGH,
                 lastVetVisit: isoStringToDate('2022-12-19T10:00:00.000Z'),
                 size: { height: 25, width: 10, length: 40 },
+                weightChange: -0.75,
             }),
             catRepo.create({
                 name: 'Garfield',
@@ -132,6 +135,7 @@ describe('paginate', () => {
                 cutenessLevel: CutenessLevel.MEDIUM,
                 lastVetVisit: isoStringToDate('2022-12-20T10:00:00.000Z'),
                 size: { height: 30, width: 15, length: 45 },
+                weightChange: 5.25,
             }),
             catRepo.create({
                 name: 'Shadow',
@@ -140,6 +144,7 @@ describe('paginate', () => {
                 cutenessLevel: CutenessLevel.HIGH,
                 lastVetVisit: isoStringToDate('2022-12-21T10:00:00.000Z'),
                 size: { height: 25, width: 10, length: 50 },
+                weightChange: -3,
             }),
             catRepo.create({
                 name: 'George',
@@ -148,6 +153,7 @@ describe('paginate', () => {
                 cutenessLevel: CutenessLevel.LOW,
                 lastVetVisit: null,
                 size: { height: 35, width: 12, length: 40 },
+                weightChange: 0,
             }),
             catRepo.create({
                 name: 'Leche',
@@ -156,6 +162,25 @@ describe('paginate', () => {
                 cutenessLevel: CutenessLevel.HIGH,
                 lastVetVisit: null,
                 size: { height: 10, width: 5, length: 15 },
+                weightChange: -1.25,
+            }),
+            catRepo.create({
+                name: 'Baby',
+                color: 'brown',
+                age: 0,
+                cutenessLevel: CutenessLevel.HIGH,
+                lastVetVisit: null,
+                size: { height: 10, width: 5, length: 10 },
+                weightChange: 0.01,
+            }),
+            catRepo.create({
+                name: 'Adam',
+                color: 'black',
+                age: 4,
+                cutenessLevel: CutenessLevel.LOW,
+                lastVetVisit: isoStringToDate('2022-12-22T10:00:00.000Z'),
+                size: { height: 20, width: 15, length: 50 },
+                weightChange: 4.75,
             }),
         ])
 
@@ -261,6 +286,57 @@ describe('paginate', () => {
 
         expect(result).toBeInstanceOf(Paginated)
         expect(result.data).toStrictEqual(cats.slice(0, 1))
+    })
+
+    it('should accept and use empty string as default origin in config, even if global provided', async () => {
+        updateGlobalConfig({
+            defaultOrigin: 'http://localhost:8081',
+        })
+
+        const config: PaginateConfig<CatEntity> = {
+            sortableColumns: ['id'],
+            defaultSortBy: [['id', 'ASC']],
+            defaultLimit: 1,
+            origin: '',
+        }
+
+        const query: PaginateQuery = {
+            path: 'http://localhost:8080/cat',
+        }
+
+        const result = await paginate<CatEntity>(query, catRepo, config)
+
+        expect(result).toBeInstanceOf(Paginated)
+        expect(result.links.current).toStrictEqual('/cat?page=1&limit=1&sortBy=id:ASC')
+
+        updateGlobalConfig({
+            defaultOrigin: undefined,
+        })
+    })
+
+    it('should use default origin from global config if provided, over the one from request', async () => {
+        updateGlobalConfig({
+            defaultOrigin: 'http://localhost:8081',
+        })
+
+        const config: PaginateConfig<CatEntity> = {
+            sortableColumns: ['id'],
+            defaultSortBy: [['id', 'ASC']],
+            defaultLimit: 1,
+        }
+
+        const query: PaginateQuery = {
+            path: 'http://localhost:8080/cat',
+        }
+
+        const result = await paginate<CatEntity>(query, catRepo, config)
+
+        expect(result).toBeInstanceOf(Paginated)
+        expect(result.links.current).toStrictEqual('http://localhost:8081/cat?page=1&limit=1&sortBy=id:ASC')
+
+        updateGlobalConfig({
+            defaultOrigin: undefined,
+        })
     })
 
     it('should accept a query builder', async () => {
@@ -477,7 +553,7 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        expect(result.data).toStrictEqual(cats.slice(0, PaginationLimit.DEFAULT_LIMIT))
+        expect(result.data).toStrictEqual(cats.slice(0, globalConfig.defaultLimit))
     })
 
     it('should return the count without data ignoring maxLimit if limit is COUNTER_ONLY', async () => {
@@ -493,7 +569,7 @@ describe('paginate', () => {
         const result = await paginate<CatEntity>(query, catRepo, config)
 
         expect(result.data).toStrictEqual([])
-        expect(result.meta.totalItems).toBe(5)
+        expect(result.meta.totalItems).toBe(7)
     })
 
     it('should return correct result for limited one-to-many relations', async () => {
@@ -528,7 +604,7 @@ describe('paginate', () => {
         expect(links.previous).toBe('?page=1&limit=2&sortBy=id:ASC')
         expect(links.current).toBe('?page=2&limit=2&sortBy=id:ASC')
         expect(links.next).toBe('?page=3&limit=2&sortBy=id:ASC')
-        expect(links.last).toBe('?page=3&limit=2&sortBy=id:ASC')
+        expect(links.last).toBe('?page=4&limit=2&sortBy=id:ASC')
     })
 
     it('should return a relative path', async () => {
@@ -549,7 +625,7 @@ describe('paginate', () => {
         expect(links.previous).toBe('/cats?page=1&limit=2&sortBy=id:ASC')
         expect(links.current).toBe('/cats?page=2&limit=2&sortBy=id:ASC')
         expect(links.next).toBe('/cats?page=3&limit=2&sortBy=id:ASC')
-        expect(links.last).toBe('/cats?page=3&limit=2&sortBy=id:ASC')
+        expect(links.last).toBe('/cats?page=4&limit=2&sortBy=id:ASC')
     })
 
     it('should return an absolute path', async () => {
@@ -570,7 +646,7 @@ describe('paginate', () => {
         expect(links.previous).toBe('http://localhost/cats?page=1&limit=2&sortBy=id:ASC')
         expect(links.current).toBe('http://localhost/cats?page=2&limit=2&sortBy=id:ASC')
         expect(links.next).toBe('http://localhost/cats?page=3&limit=2&sortBy=id:ASC')
-        expect(links.last).toBe('http://localhost/cats?page=3&limit=2&sortBy=id:ASC')
+        expect(links.last).toBe('http://localhost/cats?page=4&limit=2&sortBy=id:ASC')
     })
 
     it('should return an absolute path with new origin', async () => {
@@ -592,7 +668,7 @@ describe('paginate', () => {
         expect(links.previous).toBe('http://cats.example/cats?page=1&limit=2&sortBy=id:ASC')
         expect(links.current).toBe('http://cats.example/cats?page=2&limit=2&sortBy=id:ASC')
         expect(links.next).toBe('http://cats.example/cats?page=3&limit=2&sortBy=id:ASC')
-        expect(links.last).toBe('http://cats.example/cats?page=3&limit=2&sortBy=id:ASC')
+        expect(links.last).toBe('http://cats.example/cats?page=4&limit=2&sortBy=id:ASC')
     })
 
     it('should return only current link if zero results', async () => {
@@ -642,10 +718,18 @@ describe('paginate', () => {
         }
 
         const result = await paginate<CatEntity>(query, catRepo, config)
-        const expectedResult = [...cats.slice(0, -1).reverse(), cats.slice(-1)[0]]
+
+        // Extracting the indexes of non-null values ​​and null values
+        const notNullIndexes = result.data
+            .map((cat, index) => (cat.age !== null ? index : -1))
+            .filter((index) => index !== -1)
+
+        const nullIndexes = result.data
+            .map((cat, index) => (cat.age === null ? index : -1))
+            .filter((index) => index !== -1)
 
         expect(result.meta.sortBy).toStrictEqual([['age', 'ASC']])
-        expect(result.data).toStrictEqual(expectedResult)
+        expect(Math.max(...notNullIndexes)).toBeLessThan(Math.min(...nullIndexes))
     })
 
     it('should put null values first when sorting', async () => {
@@ -660,10 +744,16 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        const expectedResult = [cats[cats.length - 1], ...cats.slice(0, cats.length - 1).reverse()]
+        const nullIndexes = result.data
+            .map((cat, index) => (cat.age === null ? index : -1))
+            .filter((index) => index !== -1)
+
+        const notNullIndexes = result.data
+            .map((cat, index) => (cat.age !== null ? index : -1))
+            .filter((index) => index !== -1)
 
         expect(result.meta.sortBy).toStrictEqual([['age', 'ASC']])
-        expect(result.data).toStrictEqual(expectedResult)
+        expect(Math.max(...nullIndexes)).toBeLessThan(Math.min(...notNullIndexes))
     })
 
     it('should sort result by multiple columns', async () => {
@@ -680,11 +770,18 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
+        const sortedCats = cats.slice(0).sort((a, b) => {
+            if (a.color === b.color) {
+                return a.name.localeCompare(b.name)
+            }
+            return b.color.localeCompare(a.color)
+        })
+
         expect(result.meta.sortBy).toStrictEqual([
             ['color', 'DESC'],
             ['name', 'ASC'],
         ])
-        expect(result.data).toStrictEqual([cats[3], cats[4], cats[1], cats[0], cats[2]])
+        expect(result.data).toStrictEqual(sortedCats)
     })
 
     it('should sort result by virtual columns', async () => {
@@ -726,11 +823,18 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
+        const sortedCats = cats.slice(0).sort((a, b) => {
+            if (a.cutenessLevel === b.cutenessLevel) {
+                return a.name.localeCompare(b.name)
+            }
+            return a.cutenessLevel.localeCompare(b.cutenessLevel)
+        })
+
         expect(result.meta.sortBy).toStrictEqual([
             ['cutenessLevel', 'ASC'],
             ['name', 'ASC'],
         ])
-        expect(result.data).toStrictEqual([cats[4], cats[0], cats[2], cats[3], cats[1]])
+        expect(result.data).toStrictEqual(sortedCats)
     })
 
     it('should return result based on search term', async () => {
@@ -762,8 +866,10 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
+        const expectedCats = cats.filter((cat) => cat.cutenessLevel === CutenessLevel.HIGH)
+
         expect(result.meta.search).toStrictEqual('hi')
-        expect(result.data).toStrictEqual([cats[0], cats[2], cats[4]])
+        expect(result.data).toStrictEqual(expectedCats)
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&search=hi')
     })
 
@@ -847,6 +953,33 @@ describe('paginate', () => {
 
         expect(result.data).toStrictEqual(catHomesClone.sort((a, b) => b.cat.id - a.cat.id))
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=cat.id:DESC')
+    })
+
+    it('should handle nullSort with relations properly', async () => {
+        const config: PaginateConfig<CatEntity> = {
+            sortableColumns: ['id', 'age'],
+            nullSort: 'last',
+            defaultSortBy: [['age', 'ASC']],
+            relations: ['toys'],
+        }
+        const query: PaginateQuery = {
+            path: '',
+        }
+
+        const result = await paginate<CatEntity>(query, catRepo, config)
+
+        // Prepare expected result - cats ordered by age with null age last, including toys relation
+        const expectedResult = [...cats]
+            .sort((a, b) => {
+                if (a.age === null && b.age === null) return 0
+                if (a.age === null) return 1
+                if (b.age === null) return -1
+                return a.age - b.age
+            })
+            .map((cat) => cat.id)
+
+        expect(result.meta.sortBy).toStrictEqual([['age', 'ASC']])
+        expect(result.data.map((v) => v.id)).toStrictEqual(expectedResult)
     })
 
     it('should return result based on sort and search on many-to-one relation', async () => {
@@ -1274,17 +1407,20 @@ describe('paginate', () => {
         const cat1 = clone(cats[0])
         const cat2 = clone(cats[1])
         const catToys1 = clone(catToysWithoutShop[0])
-        const catToys2 = clone(catToysWithoutShop[2])
-        const catToys3 = clone(catToysWithoutShop[3])
+        const catToys2 = clone(catToysWithoutShop[1])
+        const catToys3 = clone(catToysWithoutShop[2])
+        const catToys4 = clone(catToysWithoutShop[3])
         delete catToys1.cat
         delete catToys2.cat
         delete catToys3.cat
-        cat1.toys = [catToys1, catToys2]
-        cat2.toys = [catToys3]
+        delete catToys4.cat
+        cat1.toys = [catToys3, catToys2, catToys1]
+        cat2.toys = [catToys4]
 
         expect(result.meta.filter).toStrictEqual({
             'toys.name': '$not:Stuffed Mouse',
         })
+        console.log(result.data[0].toys, result.data[1].toys)
         expect(result.data).toStrictEqual([cat1, cat2])
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&filter.toys.name=$not:Stuffed Mouse')
     })
@@ -1390,7 +1526,13 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        const orderedCats = [cats[4], cats[0], cats[2], cats[1], cats[3]]
+        const orderedCats = [...cats].sort((a, b) => {
+            if (a.size.height !== b.size.height) {
+                return a.size.height - b.size.height
+            }
+            return a.size.length - b.size.length
+        })
+
         expect(result.data).toStrictEqual(orderedCats)
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=size.height:ASC&sortBy=size.length:ASC')
     })
@@ -1438,7 +1580,20 @@ describe('paginate', () => {
         copyCats[0].toys = [copyToys[0], copyToys[2], copyToys[1]]
         copyCats[1].toys = [copyToys[3]]
 
-        const orderedCats = [copyCats[3], copyCats[1], copyCats[2], copyCats[0], copyCats[4]]
+        const orderedCats = [...copyCats].sort((a, b) => {
+            if (b.size.height !== a.size.height) {
+                return b.size.height - a.size.height
+            }
+
+            if (b.size.length !== a.size.length) {
+                return b.size.length - a.size.length
+            }
+
+            const maxToyHeightA = a.toys.length > 0 ? Math.max(...a.toys.map((toy) => toy.size.height)) : -Infinity
+            const maxToyHeightB = b.toys.length > 0 ? Math.max(...b.toys.map((toy) => toy.size.height)) : -Infinity
+
+            return maxToyHeightB - maxToyHeightA
+        })
 
         expect(result.data).toStrictEqual(orderedCats)
         expect(result.links.current).toBe(
@@ -1476,6 +1631,8 @@ describe('paginate', () => {
         delete toy3.cat
 
         const orderedCats = [
+            Object.assign(clone(cats[6]), { toys: [] }),
+            Object.assign(clone(cats[5]), { toys: [] }),
             Object.assign(clone(cats[4]), { toys: [] }),
             Object.assign(clone(cats[3]), { toys: [] }),
             Object.assign(clone(cats[2]), { toys: [] }),
@@ -1546,7 +1703,7 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        expect(result.data).toStrictEqual([cats[4]])
+        expect(result.data).toStrictEqual([cats[4], cats[5]])
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&search=10')
     })
 
@@ -1569,7 +1726,11 @@ describe('paginate', () => {
         copyCat.home = null
         copyCat.toys = []
 
-        expect(result.data).toStrictEqual([copyCat])
+        const copyCat2 = clone(cats[5])
+        copyCat2.home = null
+        copyCat2.toys = []
+
+        expect(result.data).toStrictEqual([copyCat, copyCat2])
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&search=10')
     })
 
@@ -1674,7 +1835,7 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        expect(result.data).toStrictEqual([cats[1], cats[3], cats[4]])
+        expect(result.data).toStrictEqual([cats[1], cats[3], cats[4], cats[5], cats[6]])
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&filter.size.height=$not:25')
     })
 
@@ -1704,6 +1865,8 @@ describe('paginate', () => {
             Object.assign(clone(cats[1]), { home: home }),
             Object.assign(clone(cats[3]), { home: null }),
             Object.assign(clone(cats[4]), { home: null }),
+            Object.assign(clone(cats[5]), { home: null }),
+            Object.assign(clone(cats[6]), { home: null }),
         ]
 
         expect(result.data).toStrictEqual(copyCats)
@@ -1881,7 +2044,7 @@ describe('paginate', () => {
         expect(result.meta.filter).toStrictEqual({
             name: '$not:Leche',
         })
-        expect(result.data).toStrictEqual([cats[2], cats[3]])
+        expect(result.data).toStrictEqual([cats[2], cats[3], cats[6]])
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&filter.name=$not:Leche')
     })
 
@@ -2000,7 +2163,7 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        expect(result.data).toStrictEqual([cats[2], cats[3]])
+        expect(result.data).toStrictEqual([cats[2], cats[3], cats[6]])
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&filter.id=$not:$in:1,2,5')
     })
 
@@ -2020,7 +2183,7 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        expect(result.data).toStrictEqual([cats[0], cats[1], cats[2]])
+        expect(result.data).toStrictEqual([cats[0], cats[1], cats[2], cats[6]])
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&filter.age=$gte:4')
     })
 
@@ -2040,7 +2203,7 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        expect(result.data).toStrictEqual([cats[1], cats[2]])
+        expect(result.data).toStrictEqual([cats[1], cats[2], cats[6]])
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&filter.age=$btw:4,5')
     })
 
@@ -2079,8 +2242,9 @@ describe('paginate', () => {
         }
 
         const result = await paginate<CatEntity>(query, catRepo, config)
+        const ageNotNullCats = cats.filter((cat) => cat.age !== null)
 
-        expect(result.data).toStrictEqual([cats[0], cats[1], cats[2], cats[3]])
+        expect(result.data).toEqual(expect.arrayContaining(ageNotNullCats))
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&filter.age=$not:$null')
     })
 
@@ -2306,7 +2470,7 @@ describe('paginate', () => {
                 tokens: { comparator, operator: '$null', suffix: '$not', value: undefined },
             },
         ])('should get filter tokens for "$string"', ({ string, tokens }) => {
-            expect(parseFilterToken(string)).toStrictEqual(tokens)
+            expect(parseFilterToken(string)).toStrictEqual({ quantifier: '$any', ...tokens })
         })
     }
 
@@ -2325,7 +2489,7 @@ describe('paginate', () => {
         }
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        expect(result.data).toStrictEqual([cats[0], cats[1], cats[2]])
+        expect(result.data).toStrictEqual([cats[0], cats[1], cats[2], cats[6]])
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&filter.age=$btw:4,5&filter.age=$or:$btw:5,6')
     })
 
@@ -2450,7 +2614,7 @@ describe('paginate', () => {
         const result = await paginate<CatEntity>(query, catRepo, config)
         const expected = cats.filter(
             (cat) =>
-                (cat.name === 'Milo' || cat.name === 'Garfield' || !cat.age) &&
+                (cat.name === 'Milo' || cat.name === 'Garfield' || cat.age === null) &&
                 (cat.color === 'brown' || cat.color === 'white') &&
                 (cat.cutenessLevel === CutenessLevel.HIGH || cat.cutenessLevel === CutenessLevel.LOW)
         )
@@ -2460,7 +2624,7 @@ describe('paginate', () => {
         )
     })
 
-    it("should return all columns if select doesn't contain all primary columns", async () => {
+    it("should return primary columns if select doesn't contain all primary columns", async () => {
         const config: PaginateConfig<CatEntity> = {
             sortableColumns: ['id', 'name'],
             select: ['name'],
@@ -2471,7 +2635,10 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        expect(result.data).toStrictEqual(cats)
+        result.data.forEach((cat, index) => {
+            expect(cat.id).toBe(cats[index].id)
+            expect(cat.name).toBe(cats[index].name)
+        })
         expect(result.meta.select).toStrictEqual(undefined)
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC')
     })
@@ -2487,6 +2654,51 @@ describe('paginate', () => {
         await catRepo.softDelete({ id: cats[0].id })
         const result = await paginate<CatEntity>(query, catRepo, config)
         expect(result.meta.totalItems).toBe(cats.length)
+        await catRepo.restore({ id: cats[0].id })
+    })
+
+    it('should return all items even if deleted, by passing with deleted in query params', async () => {
+        const config: PaginateConfig<CatEntity> = {
+            sortableColumns: ['id'],
+            allowWithDeletedInQuery: true,
+        }
+        const query: PaginateQuery = {
+            path: '',
+            withDeleted: true,
+        }
+        await catRepo.softDelete({ id: cats[0].id })
+        const result = await paginate<CatEntity>(query, catRepo, config)
+        expect(result.meta.totalItems).toBe(cats.length)
+        await catRepo.restore({ id: cats[0].id })
+    })
+
+    it('should return all items even if deleted if config specified withDeleted false', async () => {
+        const config: PaginateConfig<CatEntity> = {
+            sortableColumns: ['id'],
+            allowWithDeletedInQuery: true,
+            withDeleted: false,
+        }
+        const query: PaginateQuery = {
+            path: '',
+            withDeleted: true,
+        }
+        await catRepo.softDelete({ id: cats[0].id })
+        const result = await paginate<CatEntity>(query, catRepo, config)
+        expect(result.meta.totalItems).toBe(cats.length)
+        await catRepo.restore({ id: cats[0].id })
+    })
+
+    it('should not return items with deleted not allowed in config', async () => {
+        const config: PaginateConfig<CatEntity> = {
+            sortableColumns: ['id'],
+        }
+        const query: PaginateQuery = {
+            path: '',
+            withDeleted: true,
+        }
+        await catRepo.softDelete({ id: cats[0].id })
+        const result = await paginate<CatEntity>(query, catRepo, config)
+        expect(result.meta.totalItems).toBe(cats.length - 1)
         await catRepo.restore({ id: cats[0].id })
     })
 
@@ -2711,9 +2923,9 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        expect(result.meta.totalItems).toBe(5)
-        expect(result.data.length).toBe(5)
-        expect(result.data[0].friends.length).toBe(4)
+        expect(result.meta.totalItems).toBe(7)
+        expect(result.data.length).toBe(7)
+        expect(result.data[0].friends.length).toBe(6)
     })
 
     it('should return eager relations when set the property `loadEagerRelations` as true', async () => {
@@ -2780,11 +2992,13 @@ describe('paginate', () => {
 
         const cat = clone(cats[1])
         const catHomesClone = clone(catHomes[1])
-        const catHomePillowsClone = clone(catHomePillows[3])
-        delete catHomePillowsClone.home
+        const catHomePillowsClone = clone(catHomePillows.slice(3, 6))
+        catHomePillowsClone.forEach((pillow) => {
+            delete pillow.home
+        })
 
         catHomesClone.countCat = cats.filter((cat) => cat.id === catHomesClone.cat.id).length
-        catHomesClone.pillows = [catHomePillowsClone]
+        catHomesClone.pillows = catHomePillowsClone
         cat.home = catHomesClone
         delete cat.home.cat
 
@@ -2810,7 +3024,7 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        expect(result.data).toStrictEqual([cats[2], cats[3]])
+        expect(result.data).toStrictEqual([cats[2], cats[3], cats[5], cats[6]])
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&filter.id=$not:$in:1,2,5')
     })
 
@@ -2827,7 +3041,7 @@ describe('paginate', () => {
 
         const result = await paginate<CatEntity>(query, catRepo, config)
 
-        expect(result.data).toStrictEqual([cats[0], cats[1], cats[2], cats[3], cats[4]])
+        expect(result.data).toStrictEqual([cats[0], cats[1], cats[2], cats[3], cats[4], cats[5], cats[6]])
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&filter.id=$not:$in:1,2,5')
     })
 
@@ -2935,6 +3149,24 @@ describe('paginate', () => {
         expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC')
     })
 
+    it('uses custom count builder when provided', async () => {
+        const fakeQB = { getCount: jest.fn().mockResolvedValue(42) } as any
+        const config: PaginateConfig<CatEntity> = {
+            sortableColumns: ['id'],
+            select: ['id', 'name', 'color'],
+            buildCountQuery: () => fakeQB,
+        }
+        const query: PaginateQuery = {
+            path: '',
+            select: ['id', 'color'],
+        }
+
+        const page = await paginate<CatEntity>(query, catRepo, config)
+
+        expect(fakeQB.getCount).toHaveBeenCalledTimes(1)
+        expect(page.meta.totalItems).toBe(42)
+    })
+
     describe('should return result based on date column filter', () => {
         it('with $not and $null operators', async () => {
             const config: PaginateConfig<CatEntity> = {
@@ -2955,7 +3187,7 @@ describe('paginate', () => {
             expect(result.meta.filter).toStrictEqual({
                 lastVetVisit: '$not:$null',
             })
-            expect(result.data).toStrictEqual([cats[0], cats[1], cats[2]])
+            expect(result.data).toStrictEqual([cats[0], cats[1], cats[2], cats[6]])
             expect(result.links.current).toBe('?page=1&limit=20&sortBy=id:ASC&filter.lastVetVisit=$not:$null')
         })
 
@@ -3078,7 +3310,7 @@ describe('paginate', () => {
             expect(result.meta.filter).toStrictEqual({
                 lastVetVisit: '$gte:2022-12-20T10:00:00.000Z',
             })
-            expect(result.data).toStrictEqual([cats[1], cats[2]])
+            expect(result.data).toStrictEqual([cats[1], cats[2], cats[6]])
             expect(result.links.current).toBe(
                 '?page=1&limit=20&sortBy=id:ASC&filter.lastVetVisit=$gte:2022-12-20T10:00:00.000Z'
             )
@@ -3103,7 +3335,7 @@ describe('paginate', () => {
             expect(result.meta.filter).toStrictEqual({
                 lastVetVisit: '$gt:2022-12-20T10:00:00.000Z',
             })
-            expect(result.data).toStrictEqual([cats[2]])
+            expect(result.data).toStrictEqual([cats[2], cats[6]])
             expect(result.links.current).toBe(
                 '?page=1&limit=20&sortBy=id:ASC&filter.lastVetVisit=$gt:2022-12-20T10:00:00.000Z'
             )
@@ -3163,21 +3395,21 @@ describe('paginate', () => {
                 relations: ['toys'],
                 sortableColumns: ['id', 'toys.id'],
                 filterableColumns: {
-                    'toys.id': [FilterOperator.NULL]
-                }
+                    'toys.id': [FilterOperator.NULL],
+                },
             }
             const query: PaginateQuery = {
                 filter: {
                     // Null-filtering a relationship's PK should check
                     // for absence of the relationship
-                    'toys.id': '$null'
+                    'toys.id': '$null',
                 },
                 path: '',
             }
 
-            const result = await paginate<CatEntity>(query, catRepo, config);
+            const result = await paginate<CatEntity>(query, catRepo, config)
             // Should find only cats without toys.
-            expect(result.data.every(cat => cat.toys.length === 0)).toBe(true);
+            expect(result.data.every((cat) => cat.toys.length === 0)).toBe(true)
         })
     })
 
@@ -3417,7 +3649,7 @@ describe('paginate', () => {
                 }
 
                 const result = await paginate<CatEntity>(query, catRepo, config)
-                const expectedResult = [3, 4, 0, 1, 2].map((i) => {
+                const expectedResult = [3, 4, 5, 6, 0, 1, 2].map((i) => {
                     const ret = clone(cats[i])
                     if (i < 3) {
                         ret.home = clone(catHomes[i])
@@ -3436,288 +3668,1658 @@ describe('paginate', () => {
     }
 
     describe('cursor pagination', () => {
-        it('should paginate using cursor with cursorColumn (id)', async () => {
-            const config: PaginateConfig<CatEntity> = {
-                sortableColumns: ['id', 'name'],
-                cursorableColumns: ['id'],
-                paginationType: PaginationType.CURSOR,
-                defaultLimit: 2,
-            }
-            const query: PaginateQuery = {
-                path: '',
-                cursorColumn: 'id',
-                cursorDirection: 'after',
-            }
+        describe('sortBy: id', () => {
+            it('should paginate using cursor (sortableColumns[0], ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultLimit: 2,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                }
 
-            const result = await paginate<CatEntity>(query, catRepo, config)
+                const result = await paginate<CatEntity>(query, catRepo, config)
 
-            expect(result.data).toStrictEqual(cats.slice(0, 2))
-            expect(result.meta.firstCursor).toBe(cats[0].id.toString())
-            expect(result.meta.lastCursor).toBe(cats[1].id.toString())
-            expect(result.meta.itemsPerPage).toBe(2)
-            expect(result.links.previous).toBeUndefined()
-            expect(result.links.next).toBe(
-                `?limit=2&sortBy=id:ASC&cursor=${cats[1].id}&cursorColumn=id&cursorDirection=after`
-            )
+                expect(result.data).toStrictEqual(cats.slice(0, 2))
+                expect(result.meta.itemsPerPage).toBe(2)
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.links.previous).toBe('?limit=2&sortBy=id:DESC&cursor=V00000000001V0000') // id=1, DESC (Milo) -> V + LPAD(1, 11, '0') + V + LPAD(0, 4, '0')
+                expect(result.links.next).toBe(`?limit=2&sortBy=id:ASC&cursor=V99999999998X0000`) // id=2, ASC (Garfield) -> V + 10^11 - 2 + X + LPAD(0, 4, '0')
+            })
+
+            it('should paginate using cursor (id, ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultLimit: 2,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [['id', 'ASC']],
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                expect(result.data).toStrictEqual(cats.slice(0, 2))
+                expect(result.meta.itemsPerPage).toBe(2)
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.links.previous).toBe('?limit=2&sortBy=id:DESC&cursor=V00000000001V0000') // id=1, DESC (Milo) -> V + LPAD(1, 11, '0') + V + LPAD(0, 4, '0')
+                expect(result.links.next).toBe(`?limit=2&sortBy=id:ASC&cursor=V99999999998X0000`) // id=2, ASC (Garfield) -> V + 10^11 - 2 + X + LPAD(0, 4, '0')
+            })
+
+            it('should paginate using cursor with specific cursor value (id, ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultLimit: 2,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    cursor: 'V99999999998X0000', // id=2, ASC (Garfield)
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                expect(result.data).toStrictEqual(cats.slice(2, 4))
+                expect(result.meta.itemsPerPage).toBe(2)
+                expect(result.meta.cursor).toBe('V99999999998X0000')
+                expect(result.links.previous).toBe(`?limit=2&sortBy=id:DESC&cursor=V00000000003V0000`) // id=3, DESC (Shadow) -> V + LPAD(3, 11, '0') + V + LPAD(0, 4, '0')
+                expect(result.links.next).toBe(`?limit=2&sortBy=id:ASC&cursor=V99999999996X0000`) // id=4, ASC (George) -> V + 10^11 - 4 + X + LPAD(0, 4, '0')
+            })
+
+            it('should handle end of data with cursor pagination (id, ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultLimit: 10,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    cursor: 'V99999999993X0000', // id=7, ASC (Baby) -> V + 10^11 - 7 + X + LPAD(0, 4, '0')
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                expect(result.data).toStrictEqual([])
+                expect(result.meta.itemsPerPage).toBe(0)
+                expect(result.meta.cursor).toBe('V99999999993X0000')
+                expect(result.links.previous).toBeUndefined()
+                expect(result.links.next).toBeUndefined()
+            })
+
+            it('should paginate using cursor (id, DESC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultLimit: 2,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [['id', 'DESC']],
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                expect(result.data).toStrictEqual(cats.slice(5, 7).reverse())
+                expect(result.meta.itemsPerPage).toBe(2)
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.links.previous).toBe(`?limit=2&sortBy=id:ASC&cursor=V99999999993X0000`) // id=7, ASC (Adam) -> V + 10^11 - 7 + X + LPAD(0, 4, '0')
+                expect(result.links.next).toBe('?limit=2&sortBy=id:DESC&cursor=V00000000006V0000') // id=6, DESC (Baby) -> V + LPAD(6, 11, '0') + V + LPAD(0, 4, '0')
+            })
+
+            it('should paginate using cursor with specific cursor value (id, DESC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultLimit: 2,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    cursor: 'V00000000004V0000', // id=4, DESC (George) -> V + LPAD(4, 11, '0') + V + LPAD(0, 4, '0')
+                    sortBy: [['id', 'DESC']],
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                expect(result.data).toStrictEqual(cats.slice(1, 3).reverse())
+                expect(result.meta.itemsPerPage).toBe(2)
+                expect(result.meta.cursor).toBe('V00000000004V0000')
+                expect(result.links.previous).toBe(`?limit=2&sortBy=id:ASC&cursor=V99999999997X0000`) // id=3, ASC (Shadow) -> V + 10^11 - 3 + X + LPAD(0, 4, '0')
+                expect(result.links.next).toBe(`?limit=2&sortBy=id:DESC&cursor=V00000000002V0000`) // id=2, DESC (Garfield) -> V + LPAD(2, 11, '0') + V + LPAD(0, 4, '0')
+            })
+
+            it('should handle end of data with cursor pagination (id, DESC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultLimit: 10,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    cursor: 'V00000000001V0000', // id=1, DESC (Milo) -> V + LPAD(1, 11, '0') + V + LPAD(0, 4, '0')
+                    sortBy: [['id', 'DESC']],
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                expect(result.data).toStrictEqual([])
+                expect(result.meta.itemsPerPage).toBe(0)
+                expect(result.meta.cursor).toBe('V00000000001V0000')
+                expect(result.links.previous).toBeUndefined()
+                expect(result.links.next).toBeUndefined()
+            })
         })
 
-        it('should paginate using cursor with specific cursor value', async () => {
-            const config: PaginateConfig<CatEntity> = {
-                sortableColumns: ['id', 'name'],
-                cursorableColumns: ['id'],
-                paginationType: PaginationType.CURSOR,
-                defaultLimit: 2,
-            }
-            const query: PaginateQuery = {
-                path: '',
-                cursor: cats[1].id.toString(),
-                cursorColumn: 'id',
-                cursorDirection: 'after',
-            }
+        describe('sortBy: lastVetVisit', () => {
+            it('should handle date type cursor column (lastVetVisit, ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id', 'lastVetVisit'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultSortBy: [['lastVetVisit', 'ASC']],
+                    defaultLimit: 2,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    cursor: 'V998328556000000', // lastVetVisit=2022-12-19T10:00:00.000Z, ASC (Milo) -> V + 10^15 - 1671444000000
+                }
 
-            const result = await paginate<CatEntity>(query, catRepo, config)
+                const result = await paginate<CatEntity>(query, catRepo, config)
 
-            expect(result.data).toStrictEqual(cats.slice(2, 4))
-            expect(result.meta.firstCursor).toBe(cats[2].id.toString())
-            expect(result.meta.lastCursor).toBe(cats[3].id.toString())
-            expect(result.links.previous).toBe(
-                `?limit=2&sortBy=id:DESC&cursor=${cats[2].id}&cursorColumn=id&cursorDirection=before`
-            )
-            expect(result.links.next).toBe(
-                `?limit=2&sortBy=id:ASC&cursor=${cats[3].id}&cursorColumn=id&cursorDirection=after`
-            )
+                expect(result.data).toStrictEqual([cats[1], cats[2]]) // Garfield, Shadow
+                expect(result.links.previous).toBe(`?limit=2&sortBy=lastVetVisit:DESC&cursor=V001671530400000`) // lastVetVisit=2022-12-20T10:00:00.000Z, DESC (Garfield) -> V + LPAD(1671530400000, 15, '0')
+                expect(result.links.next).toBe(`?limit=2&sortBy=lastVetVisit:ASC&cursor=V998328383200000`) // lastVetVisit=2022-12-21T10:00:00.000Z, ASC (Shadow) -> V + 10^15 - 1671616800000
+            })
+
+            it('should handle date type cursor column with reverse order (lastVetVisit, DESC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id', 'lastVetVisit'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultSortBy: [['lastVetVisit', 'DESC']],
+                    defaultLimit: 2,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    cursor: 'V001671616800000', // lastVetVisit=2022-12-21T10:00:00.000Z, DESC (Shadow) -> V + LPAD(1671616800000, 15, '0')
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                expect(result.data).toStrictEqual([cats[1], cats[0]]) // Garfield, Milo
+                expect(result.links.previous).toBe(`?limit=2&sortBy=lastVetVisit:ASC&cursor=V998328469600000`) // lastVetVisit=2022-12-20T10:00:00.000Z, ASC (Garfield) -> V + 10^15 - 1671530400000
+                expect(result.links.next).toBe(`?limit=2&sortBy=lastVetVisit:DESC&cursor=V001671444000000`) // lastVetVisit=2022-12-19T10:00:00.000Z, DESC (Milo) -> V + LPAD(1671444000000, 15, '0')
+            })
+
+            // The range of mysql timestamp is from 1970-01-01 00:00:01
+            if (process.env.DB !== 'mariadb') {
+                it('should handle date type cursor column with zero timestamp (lastVetVisit, ASC)', async () => {
+                    // Create a new cat with lastVetVisit = new Date(0)
+                    const zeroDateCat = await catRepo.save(
+                        catRepo.create({
+                            name: 'ZeroCat',
+                            color: 'grey',
+                            age: 1,
+                            cutenessLevel: CutenessLevel.LOW,
+                            lastVetVisit: isoStringToDate('1970-01-01T00:00:00.000Z'), // new Date(0)
+                            size: { height: 20, width: 10, length: 30 },
+                            weightChange: 0,
+                        })
+                    )
+
+                    const config: PaginateConfig<CatEntity> = {
+                        sortableColumns: ['id', 'lastVetVisit'],
+                        paginationType: PaginationType.CURSOR,
+                        defaultSortBy: [['lastVetVisit', 'ASC']],
+                        defaultLimit: 2,
+                    }
+                    const query: PaginateQuery = {
+                        path: '',
+                    }
+
+                    const result = await paginate<CatEntity>(query, catRepo, config)
+
+                    // Should appear first as it has the earliest possible timestamp
+                    expect(result.data[0]).toStrictEqual(zeroDateCat)
+                    expect(result.links.previous).toBe(`?limit=2&sortBy=lastVetVisit:DESC&cursor=V000000000000000`) // lastVetVisit=1970-01-01T00:00:00.000Z, DESC (ZeroCat)
+                    expect(result.links.next).toBe(`?limit=2&sortBy=lastVetVisit:ASC&cursor=V998328556000000`) // lastVetVisit=2022-12-19T10:00:00.000Z, ASC (Milo)
+
+                    // Clean up
+                    await catRepo.remove(zeroDateCat)
+                })
+
+                it('should handle date type cursor column with zero timestamp (lastVetVisit, DESC)', async () => {
+                    // Create a new cat with lastVetVisit = new Date(0)
+                    const zeroDateCat = await catRepo.save(
+                        catRepo.create({
+                            name: 'ZeroCat',
+                            color: 'grey',
+                            age: 1,
+                            cutenessLevel: CutenessLevel.LOW,
+                            lastVetVisit: isoStringToDate('1970-01-01T00:00:00.000Z'), // new Date(0)
+                            size: { height: 20, width: 10, length: 30 },
+                            weightChange: 0,
+                        })
+                    )
+
+                    const config: PaginateConfig<CatEntity> = {
+                        sortableColumns: ['id', 'lastVetVisit'],
+                        paginationType: PaginationType.CURSOR,
+                        defaultSortBy: [['lastVetVisit', 'DESC']],
+                        defaultLimit: 2,
+                        filterableColumns: {
+                            lastVetVisit: [FilterOperator.NULL, FilterSuffix.NOT],
+                        },
+                    }
+                    const query: PaginateQuery = {
+                        path: '',
+                        filter: { lastVetVisit: '$not:$null' }, // to ensure null values are not included
+                        cursor: 'V001671444000000', // lastVetVisit=2022-12-19T10:00:00.000Z, DESC (Milo)
+                    }
+
+                    const result = await paginate<CatEntity>(query, catRepo, config)
+
+                    // Should appear last as it has the earliest possible timestamp
+                    expect(result.data[result.data.length - 1]).toStrictEqual(zeroDateCat)
+                    expect(result.links.previous).toBe(
+                        `?limit=2&sortBy=lastVetVisit:ASC&filter.lastVetVisit=$not:$null&cursor=X000000000000000`
+                    ) // lastVetVisit=1970-01-01T00:00:00.000Z, ASC (ZeroCat)
+                    expect(result.links.next).toBe(
+                        `?limit=2&sortBy=lastVetVisit:DESC&filter.lastVetVisit=$not:$null&cursor=V000000000000000`
+                    ) // lastVetVisit=1970-01-01T00:00:00.000Z, DESC (ZeroCat)
+
+                    // Clean up
+                    await catRepo.remove(zeroDateCat)
+                })
+            }
         })
 
-        it('should paginate using cursor with direction "before"', async () => {
-            const config: PaginateConfig<CatEntity> = {
-                sortableColumns: ['id', 'name'],
-                cursorableColumns: ['id'],
-                paginationType: PaginationType.CURSOR,
-                defaultLimit: 2,
-            }
-            const query: PaginateQuery = {
-                path: '',
-                cursor: cats[3].id.toString(),
-                cursorColumn: 'id',
-                cursorDirection: 'before',
-            }
+        describe('sortBy: age, lastVetVisit', () => {
+            it('should handle multiple cursor columns checking sorted data (age:ASC, lastVetVisit:ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['age', 'lastVetVisit'],
+                    paginationType: PaginationType.CURSOR,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [
+                        ['age', 'ASC'],
+                        ['lastVetVisit', 'ASC'],
+                    ],
+                }
 
-            const result = await paginate<CatEntity>(query, catRepo, config)
+                const result = await paginate<CatEntity>(query, catRepo, config)
 
-            expect(result.data).toStrictEqual(cats.slice(1, 3).reverse())
-            expect(result.meta.firstCursor).toBe(cats[2].id.toString())
-            expect(result.meta.lastCursor).toBe(cats[1].id.toString())
-            expect(result.links.previous).toBe(
-                `?limit=2&sortBy=id:ASC&cursor=${cats[2].id}&cursorColumn=id&cursorDirection=after`
-            )
-            expect(result.links.next).toBe(
-                `?limit=2&sortBy=id:DESC&cursor=${cats[1].id}&cursorColumn=id&cursorDirection=before`
-            )
+                const ageNotNullCats = cats.filter((cat) => cat.age !== null)
+                const ageNullCats = cats.filter((cat) => cat.age === null)
+                const sortedAgeNotNullCats = ageNotNullCats.sort((a, b) => {
+                    if (a.age === b.age) {
+                        return a.lastVetVisit.getTime() - b.lastVetVisit.getTime()
+                    }
+                    return a.age - b.age
+                })
+                const sortedAgeNullCats = ageNullCats.sort((a, b) => {
+                    return a.lastVetVisit.getTime() - b.lastVetVisit.getTime()
+                })
+
+                expect(result.data).toStrictEqual([...sortedAgeNotNullCats, ...sortedAgeNullCats])
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.meta.sortBy).toStrictEqual([
+                    ['age', 'ASC'],
+                    ['lastVetVisit', 'ASC'],
+                ])
+                expect(result.links.previous).toBe(
+                    '?limit=20&sortBy=age:DESC&sortBy=lastVetVisit:DESC&cursor=N00000000000X0000A000000000000000'
+                ) // age=0, DESC + lastVetVisit=null, DESC (Baby) -> N + LPAD(0, 11, '0') + X + LPAD(0, 4, '0') + A + LPAD(0, 15, '0')
+                expect(result.links.next).toBe(
+                    '?limit=20&sortBy=age:ASC&sortBy=lastVetVisit:ASC&cursor=A000000000000000A000000000000000'
+                ) // age=null, ASC + lastVetVisit=null, ASC (Leche) -> A + LPAD(0, 15, '0') + A + LPAD(0, 15, '0')
+            })
+
+            it('should handle multiple cursor columns checking combined cursor (age:ASC, lastVetVisit:ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['age', 'lastVetVisit'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultLimit: 4,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [
+                        ['age', 'ASC'],
+                        ['lastVetVisit', 'ASC'],
+                    ],
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                expect(result.data).toStrictEqual([cats[5], cats[3], cats[2], cats[6]]) // Baby, George, Shadow, Adam
+                expect(result.meta.itemsPerPage).toBe(4)
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.meta.sortBy).toStrictEqual([
+                    ['age', 'ASC'],
+                    ['lastVetVisit', 'ASC'],
+                ])
+                expect(result.links.previous).toBe(
+                    '?limit=4&sortBy=age:DESC&sortBy=lastVetVisit:DESC&cursor=N00000000000X0000A000000000000000'
+                ) // age=0, DESC + lastVetVisit=null, DESC (Baby) -> N + LPAD(0, 11, '0') + X + LPAD(0, 4, '0') + A + LPAD(0, 15, '0')
+                expect(result.links.next).toBe(
+                    '?limit=4&sortBy=age:ASC&sortBy=lastVetVisit:ASC&cursor=V99999999996X0000V998328296800000'
+                ) // age=4, ASC + lastVetVisit=2022-12-22T10:00:00.000Z, ASC (Adam) -> V + 10^11 - 4 + X + LPAD(0, 4, '0') + V + 10^15 - 1671703200000
+
+                const result2 = await paginate<CatEntity>(
+                    { ...query, cursor: 'V99999999996X0000V998328296800000' },
+                    catRepo,
+                    config
+                )
+
+                expect(result2.data).toStrictEqual([cats[1], cats[0], cats[4]]) // Garfield, Milo, Leche
+                expect(result2.meta.cursor).toBe('V99999999996X0000V998328296800000')
+                expect(result2.meta.sortBy).toStrictEqual([
+                    ['age', 'ASC'],
+                    ['lastVetVisit', 'ASC'],
+                ])
+                expect(result2.links.previous).toBe(
+                    '?limit=4&sortBy=age:DESC&sortBy=lastVetVisit:DESC&cursor=V00000000005V0000V001671530400000'
+                ) // age=5, DESC + lastVetVisit=2022-12-20T10:00:00.000Z, DESC (Garfield) -> V + LPAD(5, 11, '0') + V + LPAD(0, 4, '0') + V + LPAD(1671530400000, 15, '0')
+                expect(result2.links.next).toBe(
+                    `?limit=4&sortBy=age:ASC&sortBy=lastVetVisit:ASC&cursor=A000000000000000A000000000000000`
+                ) // age=null, ASC + lastVetVisit=null, ASC (Leche) -> A + LPAD(0, 15, '0') + A + LPAD(0, 15, '0')
+            })
+
+            it('should handle multiple cursor columns with different directions (age:DESC, lastVetVisit:ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['age', 'lastVetVisit'],
+                    paginationType: PaginationType.CURSOR,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [
+                        ['age', 'DESC'],
+                        ['lastVetVisit', 'ASC'],
+                    ],
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                const ageNotNullCats = cats.filter((cat) => cat.age !== null)
+                const ageNullCats = cats.filter((cat) => cat.age === null)
+                const sortedAgeNotNullCats = ageNotNullCats.sort((a, b) => {
+                    if (a.age === b.age) {
+                        return a.lastVetVisit.getTime() - b.lastVetVisit.getTime()
+                    }
+                    return b.age - a.age
+                })
+                const sortedAgeNullCats = ageNullCats.sort((a, b) => {
+                    return a.lastVetVisit.getTime() - b.lastVetVisit.getTime()
+                })
+
+                expect(result.data).toStrictEqual([...sortedAgeNotNullCats, ...sortedAgeNullCats]) // Milo, Garfield, Shadow, Adam, George, Baby, Leche
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.meta.sortBy).toStrictEqual([
+                    ['age', 'DESC'],
+                    ['lastVetVisit', 'ASC'],
+                ])
+                expect(result.links.previous).toBe(
+                    '?limit=20&sortBy=age:ASC&sortBy=lastVetVisit:DESC&cursor=V99999999994X0000V001671444000000'
+                ) // age=6, ASC + lastVetVisit=2022-12-19T10:00:00.000Z DESC (Milo) -> V + (10^11 - 6) + X + LPAD(0, 4, '0') + V + LPAD(1671444000000, 15, '0')
+                expect(result.links.next).toBe(
+                    `?limit=20&sortBy=age:DESC&sortBy=lastVetVisit:ASC&cursor=A000000000000000A000000000000000`
+                ) // age=null, DESC + lastVetVisit=null, ASC (Leche) -> A + LPAD(0, 15, '0') + A + LPAD(0, 15, '0')
+            })
         })
 
-        it('should paginate using dynamic cursorColumn from query', async () => {
-            const config: PaginateConfig<CatEntity> = {
-                sortableColumns: ['id', 'name', 'age'],
-                cursorableColumns: ['id', 'age'],
-                paginationType: PaginationType.CURSOR,
-                defaultLimit: 2,
-            }
-            const query: PaginateQuery = {
-                path: '',
-                cursor: '5',
-                cursorColumn: 'age',
-                cursorDirection: 'after',
-            }
+        describe('handling null and 0 values', () => {
+            it('should handle 0 and null distinctly (DESC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['age'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultSortBy: [['age', 'DESC']],
+                }
+                const result = await paginate({ path: '', limit: 6 }, catRepo, config)
 
-            const result = await paginate<CatEntity>(query, catRepo, config)
+                const ageNotNullCats = cats.filter((cat) => cat.age !== null)
 
-            expect(result.data).toStrictEqual([cats[0]]) // in case age > 5 (only 6)
-            expect(result.meta.firstCursor).toBe(cats[0].age.toString())
-            expect(result.meta.lastCursor).toBe(cats[0].age.toString())
-            expect(result.links.previous).toBe(
-                `?limit=2&sortBy=age:DESC&cursor=${cats[0].age}&cursorColumn=age&cursorDirection=before`
-            )
-            expect(result.links.next).toBe(
-                `?limit=2&sortBy=age:ASC&cursor=${cats[0].age}&cursorColumn=age&cursorDirection=after`
-            )
+                expect(result.data).toEqual(expect.arrayContaining(ageNotNullCats)) // If there are multiple data with the same age value, sorting is not guaranteed among them
+                expect(result.meta.itemsPerPage).toBe(6)
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.links.previous).toBe('?limit=6&sortBy=age:ASC&cursor=V99999999994X0000') // age=6 ASC (Milo) -> V + 10^11 - 6 + X + LPAD(0, 4, '0')
+                expect(result.links.next).toBe('?limit=6&sortBy=age:DESC&cursor=N00000000000X0000') // age=0 DESC (Baby) -> V + LPAD(0, 11, '0') + X + LPAD(0, 4, '0')
+
+                const result2 = await paginate({ path: '', cursor: 'N00000000000X0000', limit: 6 }, catRepo, config)
+
+                expect(result2.data).toStrictEqual([cats[4]]) // Leche
+                expect(result2.meta.itemsPerPage).toBe(1)
+                expect(result2.meta.cursor).toBe('N00000000000X0000')
+                expect(result2.links.previous).toBe('?limit=6&sortBy=age:ASC&cursor=A000000000000000') // age=null ASC (Leche) -> A + LPAD(0, 15, '0')
+                expect(result2.links.current).toBe('?limit=6&sortBy=age:DESC&cursor=N00000000000X0000')
+                expect(result2.links.next).toBe('?limit=6&sortBy=age:DESC&cursor=A000000000000000') // age=null DESC (Leche) -> A + LPAD(0, 15, '0')
+            })
+
+            it('should handle 0 and null distinctly (ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['age'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultSortBy: [['age', 'ASC']],
+                }
+                const result = await paginate({ path: '', limit: 1 }, catRepo, config)
+
+                expect(result.data).toStrictEqual([cats[5]]) // Baby
+                expect(result.meta.itemsPerPage).toBe(1)
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.links.previous).toBe('?limit=1&sortBy=age:DESC&cursor=N00000000000X0000') // age=0 DESC (Baby) -> N + LPAD(0, 11, '0') + X + LPAD(0, 4, '0')
+                expect(result.links.next).toBe('?limit=1&sortBy=age:ASC&cursor=X00000000000X0000') // age=0 ASC (Baby) -> X + LPAD(0, 11, '0') + X + LPAD(0, 4, '0')
+
+                const result2 = await paginate({ path: '', cursor: 'X00000000000X0000' }, catRepo, config)
+
+                const catsExceptBaby = cats.filter((cat) => cat.name !== 'Baby')
+
+                expect(result2.data).toEqual(expect.arrayContaining(catsExceptBaby)) // cats except Baby
+                expect(result2.meta.cursor).toBe('X00000000000X0000')
+                expect(result2.links.previous).toBe('?limit=20&sortBy=age:DESC&cursor=V00000000003V0000') // age=3 DESC (George) -> V + LPAD(3, 11, '0') + X + LPAD(0, 4, '0')
+                expect(result2.links.current).toBe('?limit=20&sortBy=age:ASC&cursor=X00000000000X0000')
+                expect(result2.links.next).toBe('?limit=20&sortBy=age:ASC&cursor=A000000000000000') // age=null ASC (Leche) -> A + LPAD(0, 15, '0')
+            })
         })
 
-        it('should handle end of data with cursor pagination', async () => {
-            const config: PaginateConfig<CatEntity> = {
-                sortableColumns: ['id', 'name'],
-                cursorableColumns: ['id'],
-                paginationType: PaginationType.CURSOR,
-                defaultLimit: 10,
-            }
-            const query: PaginateQuery = {
-                path: '',
-                cursor: cats[4].id.toString(),
-                cursorColumn: 'id',
-                cursorDirection: 'after',
-            }
+        describe('with other options', () => {
+            it('should work with filter and cursor pagination (sortBy id + filter color)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultLimit: 2,
+                    filterableColumns: {
+                        color: [FilterOperator.EQ],
+                    },
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    filter: { color: 'white' },
+                }
 
-            const result = await paginate<CatEntity>(query, catRepo, config)
+                const result = await paginate<CatEntity>(query, catRepo, config)
 
-            expect(result.data).toStrictEqual([])
-            expect(result.meta.firstCursor).toBeUndefined()
-            expect(result.meta.lastCursor).toBeUndefined()
-            expect(result.meta.itemsPerPage).toBe(0)
-            expect(result.links.previous).toBeUndefined()
-            expect(result.links.next).toBeUndefined()
+                const whiteCats = cats.filter((cat) => cat.color === 'white')
+                expect(result.data).toStrictEqual(whiteCats.slice(0, 2))
+                expect(result.links.previous).toBe(
+                    '?limit=2&sortBy=id:DESC&filter.color=white&cursor=V00000000004V0000'
+                )
+                expect(result.links.current).toBe('?limit=2&sortBy=id:ASC&filter.color=white')
+                expect(result.links.next).toBe(`?limit=2&sortBy=id:ASC&filter.color=white&cursor=V99999999995X0000`)
+            })
+
+            it('should work with filter and cursor pagination (sortBy id + filter age)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    paginationType: PaginationType.CURSOR,
+                    filterableColumns: {
+                        age: [FilterSuffix.NOT, FilterOperator.NULL],
+                    },
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [['id', 'ASC']],
+                    filter: { age: '$not:$null' },
+                    limit: 20,
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                const ageNotNullCats = cats.filter((cat) => cat.age !== null)
+                expect(result.data).toStrictEqual(ageNotNullCats.sort((a, b) => a.id - b.id))
+                expect(result.links.previous).toBe(
+                    '?limit=20&sortBy=id:DESC&filter.age=$not:$null&cursor=V00000000001V0000'
+                )
+                expect(result.links.current).toBe('?limit=20&sortBy=id:ASC&filter.age=$not:$null')
+                expect(result.links.next).toBe('?limit=20&sortBy=id:ASC&filter.age=$not:$null&cursor=V99999999993X0000')
+            })
         })
 
-        it('should work with filter and cursor pagination', async () => {
-            const config: PaginateConfig<CatEntity> = {
-                sortableColumns: ['id', 'name'],
-                cursorableColumns: ['id'],
-                paginationType: PaginationType.CURSOR,
-                defaultLimit: 2,
-                filterableColumns: {
-                    color: [FilterOperator.EQ],
-                },
-            }
-            const query: PaginateQuery = {
-                path: '',
-                cursor: undefined,
-                cursorColumn: 'id',
-                cursorDirection: 'after',
-                filter: {
-                    color: 'white',
-                },
-            }
+        describe('handling data including decimal and negative numbers', () => {
+            it('should handle data including decimal and negative numbers (weightChange, ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['weightChange'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultSortBy: [['weightChange', 'ASC']],
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                }
 
-            const result = await paginate<CatEntity>(query, catRepo, config)
+                const result = await paginate<CatEntity>(query, catRepo, config)
 
-            const whiteCats = cats.filter((cat) => cat.color === 'white')
-            expect(result.data).toStrictEqual(whiteCats.slice(0, 2))
-            expect(result.meta.firstCursor).toBe(whiteCats[0].id.toString())
-            expect(result.meta.lastCursor).toBe(whiteCats[1].id.toString())
-            expect(result.links.previous).toBeUndefined()
-            expect(result.links.next).toBe(
-                `?limit=2&sortBy=id:ASC&filter.color=white&cursor=${whiteCats[1].id}&cursorColumn=id&cursorDirection=after`
-            )
+                const sortedCats = [...cats].sort((a, b) => a.weightChange - b.weightChange)
+                expect(result.data).toEqual(sortedCats)
+                expect(result.links.previous).toBe('?limit=20&sortBy=weightChange:DESC&cursor=M99999999997X0000') // weightChange=-3.00 DESC (Shadow) -> (M + 10^11 - 3) + (X + PAD(0, 4, '0'))
+                expect(result.links.next).toBe('?limit=20&sortBy=weightChange:ASC&cursor=V99999999995V7500') // weightChange=5.25 ASC (Garfield) -> (V + 10^11 - 5) + (V + 10^4 - 2500)
+            })
+
+            it('should handle data including decimal and negative numbers (weightChange, DESC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['weightChange'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultSortBy: [['weightChange', 'DESC']],
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                const sortedCats = [...cats].sort((a, b) => b.weightChange - a.weightChange)
+                expect(result.data).toEqual(sortedCats)
+                expect(result.links.previous).toBe('?limit=20&sortBy=weightChange:ASC&cursor=V99999999995V7500') // weightChange=5.25 ASC (Garfield) -> (V + 10^11 - 5) + (V + 10^4 - 2500)
+                expect(result.links.next).toBe('?limit=20&sortBy=weightChange:DESC&cursor=M99999999997X0000') // weightChange=-3.00 DESC (Shadow) -> (M + 10^11 - 3) + (X + LPAD(0, 4, '0'))
+            })
+
+            it('should put null values last', async () => {
+                const nullCat = await catRepo.save(
+                    catRepo.create({
+                        name: 'nullCat',
+                        color: 'black',
+                        age: null,
+                        weightChange: null,
+                        cutenessLevel: CutenessLevel.LOW,
+                        size: { height: 0, width: 0, length: 0 },
+                    })
+                )
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['weightChange'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultSortBy: [['weightChange', 'ASC']],
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                expect(result.data[result.data.length - 1]).toStrictEqual(nullCat)
+
+                await catRepo.remove(nullCat)
+            })
+
+            it('should handle multiple cursor columns checking sorted data (age:ASC, weightChange:ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['age', 'weightChange'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultSortBy: [
+                        ['age', 'ASC'],
+                        ['weightChange', 'ASC'],
+                    ],
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                const ageNotNullCats = cats.filter((cat) => cat.age !== null)
+                const ageNullCats = cats.filter((cat) => cat.age === null)
+                const sortedAgeNotNullCats = ageNotNullCats.sort((a, b) => {
+                    if (a.age === b.age) {
+                        return a.weightChange - b.weightChange
+                    }
+                    return a.age - b.age
+                })
+                const sortedAgeNullCats = ageNullCats.sort((a, b) => {
+                    return a.weightChange - b.weightChange
+                })
+
+                expect(result.data).toEqual([...sortedAgeNotNullCats, ...sortedAgeNullCats])
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.meta.sortBy).toStrictEqual([
+                    ['age', 'ASC'],
+                    ['weightChange', 'ASC'],
+                ])
+                expect(result.links.previous).toBe(
+                    '?limit=20&sortBy=age:DESC&sortBy=weightChange:DESC&cursor=N00000000000X0000V00000000000V0100'
+                ) // age=0, DESC + weightChange=0.01 DESC (Baby) -> (V + LPAD(0, 11, '0')) + (X + LPAD(0, 4, '0')) + (V + LPAD(0, 11, '0')) + (V + LPAD(100, 4, '0'))
+                expect(result.links.next).toBe(
+                    '?limit=20&sortBy=age:ASC&sortBy=weightChange:ASC&cursor=A000000000000000Y00000000001V2500'
+                ) // age=null, ASC + weightChange=-1.25 ASC (Leche) -> (A + LPAD(0, 15, '0')) + (Y + LPAD(1, 11, '0')) + (V + LPAD(2500, 4, '0'))
+            })
+
+            it('should handle multiple cursor columns with different directions (age:DESC, weightChange:ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['age', 'weightChange'],
+                    paginationType: PaginationType.CURSOR,
+                    defaultSortBy: [
+                        ['age', 'DESC'],
+                        ['weightChange', 'ASC'],
+                    ],
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                const ageNotNullCats = cats.filter((cat) => cat.age !== null)
+                const ageNullCats = cats.filter((cat) => cat.age === null)
+                const sortedAgeNotNullCats = ageNotNullCats.sort((a, b) => {
+                    if (a.age === b.age) {
+                        return a.weightChange - b.weightChange
+                    }
+                    return b.age - a.age
+                })
+                const sortedAgeNullCats = ageNullCats.sort((a, b) => {
+                    return a.weightChange - b.weightChange
+                })
+                expect(result.data).toEqual([...sortedAgeNotNullCats, ...sortedAgeNullCats])
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.meta.sortBy).toStrictEqual([
+                    ['age', 'DESC'],
+                    ['weightChange', 'ASC'],
+                ])
+                expect(result.links.previous).toBe(
+                    '?limit=20&sortBy=age:ASC&sortBy=weightChange:DESC&cursor=V99999999994X0000N00000000000V2500'
+                ) // age=6, ASC + weightChange=-0.75 DESC (Milo) -> (V + 10^11 - 6) + (X + LPAD(0, 4, '0')) + (N + LPAD(0, 11, '0')) + (V + LPAD(10^4 - 7500), 4, '0'))
+                expect(result.links.next).toBe(
+                    '?limit=20&sortBy=age:DESC&sortBy=weightChange:ASC&cursor=A000000000000000Y00000000001V2500'
+                ) // age=null, DESC + weightChange=-1.25 ASC (Leche) -> (A + LPAD(0, 15, '0')) + (Y + LPAD(1, 11, '0')) + (V + LPAD(2500, 4, '0'))
+            })
         })
 
-        it('should throw error if cursorColumn is not in cursorableColumns', async () => {
-            const config: PaginateConfig<CatEntity> = {
-                sortableColumns: ['id', 'name'],
-                cursorableColumns: ['id'],
-                paginationType: PaginationType.CURSOR,
-                defaultLimit: 2,
-            }
+        describe('handling relation column', () => {
+            let relationTestCats: CatEntity[]
+            let relationTestToys: CatToyEntity[]
+            let relationTestCatsIds: number[]
+            let relationTestToysIds: number[]
+
+            beforeAll(async () => {
+                relationTestCats = await catRepo.save([
+                    catRepo.create({
+                        name: 'TestCat1',
+                        color: 'orange',
+                        age: 2,
+                        cutenessLevel: CutenessLevel.MEDIUM,
+                        lastVetVisit: isoStringToDate('2022-11-15T10:00:00.000Z'),
+                        size: { height: 22, width: 8, length: 35 },
+                        weightChange: 1.5,
+                    }),
+                    catRepo.create({
+                        name: 'TestCat2',
+                        color: 'grey',
+                        age: 3,
+                        cutenessLevel: CutenessLevel.HIGH,
+                        lastVetVisit: isoStringToDate('2022-11-20T10:00:00.000Z'),
+                        size: { height: 28, width: 12, length: 42 },
+                        weightChange: -0.8,
+                    }),
+                    catRepo.create({
+                        name: 'TestCat3',
+                        color: 'cream',
+                        age: 4,
+                        cutenessLevel: CutenessLevel.LOW,
+                        lastVetVisit: isoStringToDate('2022-11-25T10:00:00.000Z'),
+                        size: { height: 18, width: 9, length: 38 },
+                        weightChange: 2.2,
+                    }),
+                ])
+                relationTestCatsIds = relationTestCats.map((cat) => cat.id)
+
+                relationTestToys = await catToyRepo.save([
+                    catToyRepo.create({
+                        name: 'TestToy1',
+                        cat: relationTestCats[0],
+                        size: { height: 3, width: 3, length: 8 },
+                    }),
+                    catToyRepo.create({
+                        name: 'TestToy2',
+                        cat: relationTestCats[0],
+                        size: { height: 6, width: 2, length: 7 },
+                    }),
+                    catToyRepo.create({
+                        name: 'TestToy3',
+                        cat: relationTestCats[1],
+                        size: { height: 2, width: 2, length: 10 },
+                    }),
+                    catToyRepo.create({
+                        name: 'TestToy4',
+                        cat: relationTestCats[2],
+                        size: { height: 5, width: 5, length: 5 },
+                    }),
+                ])
+                relationTestToysIds = relationTestToys.map((toy) => toy.id)
+            })
+
+            afterAll(async () => {
+                if (relationTestToys?.length) {
+                    await catToyRepo.remove(relationTestToys)
+                }
+                if (relationTestCats?.length) {
+                    await catRepo.remove(relationTestCats)
+                }
+            })
+
+            it('should handle cursor pagination on many-to-one relation column (cat.age, ASC)', async () => {
+                const config: PaginateConfig<CatToyEntity> = {
+                    sortableColumns: ['cat.age'],
+                    paginationType: PaginationType.CURSOR,
+                    relations: ['cat'],
+                    filterableColumns: {
+                        id: [FilterOperator.IN],
+                    },
+                    defaultLimit: 4,
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [['cat.age', 'ASC']],
+                    filter: { id: `$in:${relationTestToysIds.join(',')}` }, // Filter by test toy IDs
+                }
+
+                const result = await paginate<CatToyEntity>(query, catToyRepo, config)
+
+                expect(result.data.length).toBe(4)
+                expect(result.data[0].cat.age).toBeLessThanOrEqual(result.data[1].cat.age)
+                expect(result.data[1].cat.age).toBeLessThanOrEqual(result.data[2].cat.age)
+                expect(result.data[2].cat.age).toBeLessThanOrEqual(result.data[3].cat.age)
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.links.previous).toBe(
+                    `?limit=4&sortBy=cat.age:DESC&filter.id=$in:${relationTestToysIds.join(
+                        ','
+                    )}&cursor=V00000000002V0000`
+                )
+                expect(result.links.next).toBe(
+                    `?limit=4&sortBy=cat.age:ASC&filter.id=$in:${relationTestToysIds.join(
+                        ','
+                    )}&cursor=V99999999996X0000`
+                )
+            })
+
+            it('should handle cursor pagination on many-to-one relation column with cursor (cat.age, ASC)', async () => {
+                const config: PaginateConfig<CatToyEntity> = {
+                    sortableColumns: ['cat.age'],
+                    paginationType: PaginationType.CURSOR,
+                    relations: ['cat'],
+                    defaultLimit: 2,
+                }
+
+                // First, get the first page of results
+                const firstPageQuery: PaginateQuery = {
+                    path: '',
+                    sortBy: [['cat.age', 'ASC']],
+                }
+                const firstResult = await paginate<CatToyEntity>(firstPageQuery, catToyRepo, config)
+                expect(firstResult.data.length).toBe(2)
+                expect(firstResult.links.previous).toBe('?limit=2&sortBy=cat.age:DESC&cursor=V00000000002V0000')
+                expect(firstResult.links.next).toBe('?limit=2&sortBy=cat.age:ASC&cursor=V99999999998X0000')
+                expect(firstResult.data[0].cat.age).toBeLessThanOrEqual(firstResult.data[1].cat.age)
+
+                // Extract cursor from the next link
+                const cursor = firstResult.links.next.split('cursor=')[1]
+                expect(cursor).toBeDefined()
+
+                // Use the cursor to get the next page
+                const secondPageQuery: PaginateQuery = {
+                    path: '',
+                    sortBy: [['cat.age', 'ASC']],
+                    cursor: cursor,
+                }
+
+                const secondResult = await paginate<CatToyEntity>(secondPageQuery, catToyRepo, config)
+
+                expect(secondResult.data.length).toBe(2)
+                expect(firstResult.data[1].cat.age).toBeLessThanOrEqual(secondResult.data[0].cat.age)
+                expect(secondResult.data[0].cat.age).toBeLessThanOrEqual(secondResult.data[1].cat.age)
+                expect(secondResult.meta.cursor).toBe(cursor)
+                expect(secondResult.links.previous).toBe('?limit=2&sortBy=cat.age:DESC&cursor=V00000000003V0000')
+                expect(secondResult.links.next).toBe('?limit=2&sortBy=cat.age:ASC&cursor=V99999999996X0000')
+            })
+
+            it('should handle cursor pagination on many-to-one relation column (cat.age, DESC)', async () => {
+                const config: PaginateConfig<CatToyEntity> = {
+                    sortableColumns: ['cat.age'],
+                    paginationType: PaginationType.CURSOR,
+                    relations: ['cat'],
+                    filterableColumns: {
+                        id: [FilterOperator.IN],
+                    },
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [['cat.age', 'DESC']],
+                    filter: { id: `$in:${relationTestToysIds.join(',')}` }, // Filter by test toy IDs
+                }
+
+                const result = await paginate<CatToyEntity>(query, catToyRepo, config)
+
+                expect(result.data.length).toBe(4)
+                expect(result.data[0].cat.age).toBeGreaterThanOrEqual(result.data[1].cat.age)
+                expect(result.data[1].cat.age).toBeGreaterThanOrEqual(result.data[2].cat.age)
+                expect(result.data[2].cat.age).toBeGreaterThanOrEqual(result.data[3].cat.age)
+                expect(result.meta.cursor).toBeUndefined()
+                expect(result.links.previous).toBe(
+                    `?limit=20&sortBy=cat.age:ASC&filter.id=$in:${relationTestToysIds.join(
+                        ','
+                    )}&cursor=V99999999996X0000`
+                )
+                expect(result.links.next).toBe(
+                    `?limit=20&sortBy=cat.age:DESC&filter.id=$in:${relationTestToysIds.join(
+                        ','
+                    )}&cursor=V00000000002V0000`
+                )
+            })
+
+            it('should handle cursor pagination on many-to-one relation column with cursor (cat.age, DESC)', async () => {
+                const config: PaginateConfig<CatToyEntity> = {
+                    sortableColumns: ['cat.age'],
+                    paginationType: PaginationType.CURSOR,
+                    relations: ['cat'],
+                    defaultLimit: 2,
+                }
+
+                // First, get the first page of results
+                const firstPageQuery: PaginateQuery = {
+                    path: '',
+                    sortBy: [['cat.age', 'DESC']],
+                }
+                const firstResult = await paginate<CatToyEntity>(firstPageQuery, catToyRepo, config)
+                expect(firstResult.data.length).toBe(2)
+                expect(firstResult.links.previous).toBe('?limit=2&sortBy=cat.age:ASC&cursor=V99999999994X0000')
+                expect(firstResult.links.next).toBe('?limit=2&sortBy=cat.age:DESC&cursor=V00000000006V0000')
+                expect(firstResult.data[0].cat.age).toBeGreaterThanOrEqual(firstResult.data[1].cat.age)
+
+                // Extract cursor from the next link
+                const cursor = firstResult.links.next.split('cursor=')[1]
+                expect(cursor).toBeDefined()
+
+                // Use the cursor to get the next page
+                const secondPageQuery: PaginateQuery = {
+                    path: '',
+                    sortBy: [['cat.age', 'DESC']],
+                    cursor: cursor,
+                }
+
+                const secondResult = await paginate<CatToyEntity>(secondPageQuery, catToyRepo, config)
+
+                expect(secondResult.data.length).toBe(2)
+                expect(firstResult.data[1].cat.age).toBeGreaterThanOrEqual(secondResult.data[0].cat.age)
+                expect(secondResult.data[0].cat.age).toBeGreaterThanOrEqual(secondResult.data[1].cat.age)
+                expect(secondResult.meta.cursor).toBe(cursor)
+                expect(secondResult.links.previous).toBe('?limit=2&sortBy=cat.age:ASC&cursor=V99999999995X0000')
+                expect(secondResult.links.next).toBe('?limit=2&sortBy=cat.age:DESC&cursor=V00000000004V0000')
+            })
+
+            it('should handle cursor pagination on one-to-many relation column & embedded entity (toys.(size.height), ASC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['toys.(size.height)'],
+                    paginationType: PaginationType.CURSOR,
+                    relations: ['toys'],
+                    filterableColumns: {
+                        id: [FilterOperator.IN],
+                    },
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [['toys.(size.height)', 'ASC']],
+                    filter: { id: `$in:${relationTestCatsIds.join(',')}` }, // Filter by test toy IDs
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                // Verify sort order - toys.(size.height) ASC
+                // Former cat should have toys with shortest height, then latter cat
+                if (result.data[0].toys.length > 0 && result.data[1].toys.length > 0) {
+                    const minHeight1 = Math.min(...result.data[0].toys.map((toy) => toy.size.height))
+                    const minHeight2 = Math.min(...result.data[1].toys.map((toy) => toy.size.height))
+                    expect(minHeight1).toBeLessThanOrEqual(minHeight2)
+                }
+                if (result.data[1].toys.length > 0 && result.data[2].toys.length > 0) {
+                    const minHeight1 = Math.min(...result.data[1].toys.map((toy) => toy.size.height))
+                    const minHeight2 = Math.min(...result.data[2].toys.map((toy) => toy.size.height))
+                    expect(minHeight1).toBeLessThanOrEqual(minHeight2)
+                }
+                expect(result.links.previous).toBe(
+                    `?limit=20&sortBy=toys.(size.height):DESC&filter.id=$in:${relationTestCatsIds.join(
+                        ','
+                    )}&cursor=V00000000002V0000`
+                )
+                expect(result.links.next).toBe(
+                    `?limit=20&sortBy=toys.(size.height):ASC&filter.id=$in:${relationTestCatsIds.join(
+                        ','
+                    )}&cursor=V99999999995X0000`
+                )
+            })
+
+            it('should handle cursor pagination on one-to-many relation column & embedded entity (toys.(size.height), ASC) for a cat that has more than one toy', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['toys.(size.height)'],
+                    paginationType: PaginationType.CURSOR,
+                    relations: ['toys'],
+                    filterableColumns: {
+                        id: [FilterOperator.IN],
+                    },
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [['toys.(size.height)', 'ASC']],
+                    cursor: 'V99999999996X0000',
+                    filter: { id: `$in:${relationTestCatsIds.join(',')}` }, // Filter by test toy IDs
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                // Verify sort order - toys.(size.height) ASC
+                // Former cat should have toys with shortest height, then latter cat
+                if (result.data[0].toys.length > 0 && result.data[1].toys.length > 0) {
+                    const minHeight1 = Math.min(...result.data[0].toys.map((toy) => toy.size.height))
+                    const minHeight2 = Math.min(...result.data[1].toys.map((toy) => toy.size.height))
+                    expect(minHeight1).toBeLessThanOrEqual(minHeight2)
+                }
+                expect(result.links.previous).toBe(
+                    `?limit=20&sortBy=toys.(size.height):DESC&filter.id=$in:${relationTestCatsIds.join(
+                        ','
+                    )}&cursor=V00000000005V0000`
+                )
+                expect(result.links.next).toBe(
+                    `?limit=20&sortBy=toys.(size.height):ASC&filter.id=$in:${relationTestCatsIds.join(
+                        ','
+                    )}&cursor=V99999999994X0000`
+                )
+            })
+
+            it('should handle cursor pagination on one-to-many relation column & embedded entity (toys.(size.height), DESC)', async () => {
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['toys.(size.height)'],
+                    paginationType: PaginationType.CURSOR,
+                    relations: ['toys'],
+                    filterableColumns: {
+                        id: [FilterOperator.IN],
+                    },
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [['toys.(size.height)', 'DESC']],
+                    filter: { id: `$in:${relationTestCatsIds.join(',')}` }, // Filter by test toy IDs
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+
+                // Verify sort order - toys.(size.height) DESC
+                // Former cat should have toys with tallest height, then latter cat
+                if (result.data[0].toys.length > 0 && result.data[1].toys.length > 0) {
+                    const maxHeight1 = Math.max(...result.data[0].toys.map((toy) => toy.size.height))
+                    const maxHeight2 = Math.max(...result.data[1].toys.map((toy) => toy.size.height))
+                    expect(maxHeight1).toBeGreaterThanOrEqual(maxHeight2)
+                }
+                if (result.data[1].toys.length > 0 && result.data[2].toys.length > 0) {
+                    const maxHeight1 = Math.max(...result.data[1].toys.map((toy) => toy.size.height))
+                    const maxHeight2 = Math.max(...result.data[2].toys.map((toy) => toy.size.height))
+                    expect(maxHeight1).toBeGreaterThanOrEqual(maxHeight2)
+                }
+                expect(result.links.previous).toBe(
+                    `?limit=20&sortBy=toys.(size.height):ASC&filter.id=$in:${relationTestCatsIds.join(
+                        ','
+                    )}&cursor=V99999999994X0000`
+                )
+                expect(result.links.next).toBe(
+                    `?limit=20&sortBy=toys.(size.height):DESC&filter.id=$in:${relationTestCatsIds.join(
+                        ','
+                    )}&cursor=V00000000002V0000`
+                )
+            })
+
+            it('should handle cursor pagination on one-to-one relation column (cat.lastVetVisit, ASC)', async () => {
+                const config: PaginateConfig<CatToyEntity> = {
+                    sortableColumns: ['cat.lastVetVisit'],
+                    paginationType: PaginationType.CURSOR,
+                    relations: ['cat'],
+                    filterableColumns: {
+                        id: [FilterOperator.IN],
+                    },
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [['cat.lastVetVisit', 'ASC']],
+                    filter: { id: `$in:${relationTestToysIds.join(',')}` }, // Filter by test toy IDs
+                }
+
+                const result = await paginate<CatToyEntity>(query, catToyRepo, config)
+
+                expect(result.data.length).toBe(4)
+
+                // Verify sort order - cat.lastVetVisit ASC
+                // Toys should be ordered by their cats' last vet visit date ASC
+                const date1 = new Date(result.data[0].cat.lastVetVisit).getTime()
+                const date2 = new Date(result.data[1].cat.lastVetVisit).getTime()
+                const date3 = new Date(result.data[2].cat.lastVetVisit).getTime()
+                const date4 = new Date(result.data[3].cat.lastVetVisit).getTime()
+                expect(date1).toBeLessThanOrEqual(date2)
+                expect(date2).toBeLessThanOrEqual(date3)
+                expect(date3).toBeLessThanOrEqual(date4)
+                expect(result.links.previous).toBe(
+                    `?limit=20&sortBy=cat.lastVetVisit:DESC&filter.id=$in:${relationTestToysIds.join(
+                        ','
+                    )}&cursor=V001668506400000`
+                )
+                expect(result.links.next).toBe(
+                    `?limit=20&sortBy=cat.lastVetVisit:ASC&filter.id=$in:${relationTestToysIds.join(
+                        ','
+                    )}&cursor=V998330629600000`
+                )
+            })
+
+            it('should handle cursor pagination on one-to-one relation column (cat.lastVetVisit, DESC)', async () => {
+                const config: PaginateConfig<CatToyEntity> = {
+                    sortableColumns: ['cat.lastVetVisit'],
+                    paginationType: PaginationType.CURSOR,
+                    relations: ['cat'],
+                    filterableColumns: {
+                        id: [FilterOperator.IN],
+                    },
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [['cat.lastVetVisit', 'DESC']],
+                    filter: { id: `$in:${relationTestToysIds.join(',')}` }, // Filter by test toy IDs
+                }
+
+                const result = await paginate<CatToyEntity>(query, catToyRepo, config)
+
+                expect(result.data.length).toBe(4)
+
+                // Verify sort order - cat.lastVetVisit DESC
+                // Toys should be ordered by their cats' last vet visit date DESC
+                const date1 = new Date(result.data[0].cat.lastVetVisit).getTime()
+                const date2 = new Date(result.data[1].cat.lastVetVisit).getTime()
+                const date3 = new Date(result.data[2].cat.lastVetVisit).getTime()
+                const date4 = new Date(result.data[3].cat.lastVetVisit).getTime()
+                expect(date1).toBeGreaterThanOrEqual(date2)
+                expect(date2).toBeGreaterThanOrEqual(date3)
+                expect(date3).toBeGreaterThanOrEqual(date4)
+                expect(result.links.previous).toBe(
+                    `?limit=20&sortBy=cat.lastVetVisit:ASC&filter.id=$in:${relationTestToysIds.join(
+                        ','
+                    )}&cursor=V998330629600000`
+                )
+                expect(result.links.next).toBe(
+                    `?limit=20&sortBy=cat.lastVetVisit:DESC&filter.id=$in:${relationTestToysIds.join(
+                        ','
+                    )}&cursor=V001668506400000`
+                )
+            })
+
+            it('should handle multiple cursor columns with relation (cat.age:ASC, id:DESC)', async () => {
+                // Configure pagination with multiple sorting criteria - cat.age ASC and id DESC
+                const config: PaginateConfig<CatToyEntity> = {
+                    sortableColumns: ['cat.age', 'id'],
+                    paginationType: PaginationType.CURSOR,
+                    relations: ['cat'],
+                }
+                const query: PaginateQuery = {
+                    path: '',
+                    sortBy: [
+                        ['cat.age', 'ASC'],
+                        ['id', 'DESC'],
+                    ],
+                }
+
+                const result = await paginate<CatToyEntity>(query, catToyRepo, config)
+
+                // Verify results exist
+                expect(result.data.length).toBeGreaterThan(0)
+
+                // Verify sort order - first by cat.age ASC, then by id DESC
+                if (result.data.length >= 2) {
+                    for (let i = 0; i < result.data.length - 1; i++) {
+                        if (result.data[i].cat.age === result.data[i + 1].cat.age) {
+                            // If ages are equal, ids should be in DESC order
+                            expect(result.data[i].id).toBeGreaterThanOrEqual(result.data[i + 1].id)
+                        } else {
+                            // Otherwise ages should be in ASC order
+                            expect(result.data[i].cat.age).toBeLessThan(result.data[i + 1].cat.age)
+                        }
+                    }
+                }
+
+                expect(result.links.previous).toBe(
+                    '?limit=20&sortBy=cat.age:DESC&sortBy=id:ASC&cursor=V00000000002V0000V99999999994X0000'
+                )
+                expect(result.links.next).toBe(
+                    '?limit=20&sortBy=cat.age:ASC&sortBy=id:DESC&cursor=V99999999994X0000V00000000001V0000'
+                )
+            })
+
+            it('should handle cursor pagination with filter on relation column', async () => {
+                const config: PaginateConfig<CatToyEntity> = {
+                    sortableColumns: ['size.height'],
+                    paginationType: PaginationType.CURSOR,
+                    relations: ['cat'],
+                    filterableColumns: {
+                        'cat.age': [FilterOperator.EQ],
+                    },
+                    defaultLimit: 4,
+                }
+
+                // Get target age from test data
+                const targetAge = relationTestCats[0].age
+
+                const query: PaginateQuery = {
+                    path: '',
+                    filter: {
+                        'cat.age': `${targetAge}`,
+                    },
+                    sortBy: [['size.height', 'ASC']],
+                }
+
+                const result = await paginate<CatToyEntity>(query, catToyRepo, config)
+
+                // Verify all toys belong to cats with the target age
+                result.data.forEach((toy) => {
+                    expect(toy.cat.age).toBe(targetAge)
+                })
+
+                // Verify sort order - size.height ASC
+                if (result.data.length >= 2) {
+                    for (let i = 0; i < result.data.length - 1; i++) {
+                        expect(result.data[i].size.height).toBeLessThanOrEqual(result.data[i + 1].size.height)
+                    }
+                }
+            })
+        })
+    })
+
+    describe('Wildcard Select', () => {
+        it('should expand * wildcard to all main entity columns', async () => {
             const query: PaginateQuery = {
-                path: '',
-                cursor: '5',
-                cursorColumn: 'age',
-                cursorDirection: 'after',
+                page: 1,
+                limit: 10,
+                select: ['*'],
+                path: '/cats',
             }
 
-            await expect(paginate<CatEntity>(query, catRepo, config)).rejects.toThrow(
-                "Invalid cursorColumn 'age'. It must be one of: id"
-            )
+            const result = await paginate(query, catRepo, {
+                sortableColumns: ['id'],
+                select: ['*'],
+            })
+
+            expect(result.data[0]).toHaveProperty('id')
+            expect(result.data[0]).toHaveProperty('name')
+            expect(result.data[0]).toHaveProperty('color')
+            expect(result.data[0]).toHaveProperty('age')
+            expect(result.data[0]).toHaveProperty('cutenessLevel')
+            expect(result.data[0]).toHaveProperty('lastVetVisit')
+            expect(result.data[0]).toHaveProperty('createdAt')
+            expect(result.data[0]).toHaveProperty('deletedAt')
+            expect(result.data[0]).toHaveProperty('weightChange')
+            expect(result.data[0]).toHaveProperty('size')
+            expect(result.data[0]).toHaveProperty('size.height')
+            expect(result.data[0]).toHaveProperty('size.width')
+            expect(result.data[0]).toHaveProperty('size.length')
         })
 
-        it('should throw error if cursorDirection is invalid', async () => {
-            const config: PaginateConfig<CatEntity> = {
-                sortableColumns: ['id', 'name'],
-                cursorableColumns: ['id'],
-                paginationType: PaginationType.CURSOR,
-                defaultLimit: 2,
-            }
+        it('should expand relation.* wildcard to all relation columns', async () => {
             const query: PaginateQuery = {
-                path: '',
-                cursor: '1',
-                cursorColumn: 'id',
-                cursorDirection: 'invalid' as any,
+                page: 1,
+                limit: 10,
+                select: ['id', 'name', 'toys.*'],
+                path: '/cats',
             }
 
-            await expect(paginate<CatEntity>(query, catRepo, config)).rejects.toThrow(
-                "Invalid cursorDirection 'invalid'. It must be 'before' or 'after'"
-            )
+            const result = await paginate(query, catRepo, {
+                sortableColumns: ['id'],
+                select: ['id', 'name', 'toys.*'],
+                relations: ['toys'],
+            })
+
+            expect(result.data[0]).toHaveProperty('id')
+            expect(result.data[0]).toHaveProperty('name')
+            expect(result.data[0]).not.toHaveProperty('color')
+            expect(result.data[0]).not.toHaveProperty('age')
+            expect(result.data[0]).not.toHaveProperty('cutenessLevel')
+            expect(result.data[0]).not.toHaveProperty('lastVetVisit')
+            expect(result.data[0]).not.toHaveProperty('createdAt')
+            expect(result.data[0]).not.toHaveProperty('deletedAt')
+            expect(result.data[0]).not.toHaveProperty('weightChange')
+            expect(result.data[0].toys[0]).toHaveProperty('id')
+            expect(result.data[0].toys[0]).toHaveProperty('name')
+            expect(result.data[0].toys[0]).toHaveProperty('createdAt')
+            expect(result.data[0].toys[0]).toHaveProperty('size')
+            expect(result.data[0].toys[0]).toHaveProperty('size.height')
+            expect(result.data[0].toys[0]).toHaveProperty('size.width')
+            expect(result.data[0].toys[0]).toHaveProperty('size.length')
         })
 
-        it('should use default cursorColumn and cursorDirection when not provided', async () => {
-            const config: PaginateConfig<CatEntity> = {
-                sortableColumns: ['id', 'name'],
-                cursorableColumns: ['id', 'lastVetVisit'],
-                paginationType: PaginationType.CURSOR,
-                defaultLimit: 2,
-            }
+        it('should handle both * and relation.* wildcards together', async () => {
             const query: PaginateQuery = {
-                path: '',
-                cursor: cats[2].id.toString(), // id=3
-                // cursorColumn and cursorDirection are intentionally omitted
+                page: 1,
+                limit: 10,
+                select: ['*', 'toys.*'],
+                path: '/cats',
             }
 
-            const result = await paginate<CatEntity>(query, catRepo, config)
+            const result = await paginate(query, catRepo, {
+                sortableColumns: ['id'],
+                select: ['*', 'toys.*'],
+                relations: ['toys'],
+            })
 
-            // cursorColumn is 'id' which is the first element of cursorableColumns, cursorDirection is 'before' which is the default setting
-            expect(result.data).toStrictEqual(cats.slice(0, 2).reverse()) // Reverse data order with id < 3 (id=2, id=1)
-            expect(result.meta.firstCursor).toBe(cats[1].id.toString()) // id=2
-            expect(result.meta.lastCursor).toBe(cats[0].id.toString()) // id=1
-            expect(result.meta.itemsPerPage).toBe(2)
-            expect(result.links.previous).toBe(
-                `?limit=2&sortBy=id:ASC&cursor=${cats[1].id}&cursorColumn=id&cursorDirection=after`
-            )
-            expect(result.links.next).toBe(
-                `?limit=2&sortBy=id:DESC&cursor=${cats[0].id}&cursorColumn=id&cursorDirection=before`
-            )
+            expect(result.data[0]).toHaveProperty('id')
+            expect(result.data[0]).toHaveProperty('name')
+            expect(result.data[0]).toHaveProperty('color')
+            expect(result.data[0]).toHaveProperty('age')
+            expect(result.data[0]).toHaveProperty('cutenessLevel')
+            expect(result.data[0]).toHaveProperty('lastVetVisit')
+            expect(result.data[0]).toHaveProperty('createdAt')
+            expect(result.data[0]).toHaveProperty('deletedAt')
+            expect(result.data[0]).toHaveProperty('weightChange')
+            expect(result.data[0].toys[0]).toHaveProperty('id')
+            expect(result.data[0].toys[0]).toHaveProperty('name')
+            expect(result.data[0].toys[0]).toHaveProperty('createdAt')
         })
 
-        it('should handle date type cursor column', async () => {
+        it('should handle non-existent relation wildcard gracefully', async () => {
+            const query: PaginateQuery = {
+                page: 1,
+                limit: 10,
+                select: ['id', 'name', 'nonExistentRelation.*'],
+                path: '/cats',
+            }
+
+            const result = await paginate(query, catRepo, {
+                sortableColumns: ['id'],
+                select: ['id', 'name', 'nonExistentRelation.*'],
+            })
+
+            expect(result.data[0]).toHaveProperty('id')
+            expect(result.data[0]).toHaveProperty('name')
+            expect(result.data[0]).not.toHaveProperty('nonExistentRelation.*')
+        })
+
+        it('should handle nested relation wildcards correctly', async () => {
+            const query: PaginateQuery = {
+                page: 1,
+                limit: 10,
+                select: ['*', 'toys.*', 'toys.shop.*', 'toys.shop.address.*'],
+                sortBy: [
+                    ['id', 'ASC'],
+                    ['toys.id', 'ASC'],
+                ],
+                path: '/cats',
+            }
+
+            const result = await paginate(query, catRepo, {
+                sortableColumns: ['id', 'toys.id'],
+                select: ['*', 'toys.*', 'toys.shop.*', 'toys.shop.address.*'],
+                relations: ['toys', 'toys.shop', 'toys.shop.address'],
+            })
+
+            expect(result.data[0]).toHaveProperty('id')
+            expect(result.data[0]).toHaveProperty('name')
+            expect(result.data[0].toys[1]).toHaveProperty('id')
+            expect(result.data[0].toys[1]).toHaveProperty('name')
+            expect(result.data[0].toys[1].shop).toHaveProperty('id')
+            expect(result.data[0].toys[1].shop).toHaveProperty('shopName')
+            expect(result.data[0].toys[1].shop.address).toHaveProperty('id')
+            expect(result.data[0].toys[1].shop.address).toHaveProperty('address')
+        })
+
+        it('should restrict query.select to only fields allowed in config.select', async () => {
+            // Server-side config only allows id and name
             const config: PaginateConfig<CatEntity> = {
                 sortableColumns: ['id'],
-                cursorableColumns: ['lastVetVisit'],
-                paginationType: PaginationType.CURSOR,
-                defaultLimit: 2,
+                select: ['id', 'name'],
             }
+
+            // Client tries to request additional fields
             const query: PaginateQuery = {
-                path: '',
-                cursor: '2022-12-20T10:00:00.000Z', // Garfield's vet visit
-                cursorColumn: 'lastVetVisit',
-                cursorDirection: 'after',
+                page: 1,
+                limit: 10,
+                select: ['id', 'name', 'color', 'age'], // color and age not in config.select
+                path: '/cats',
             }
 
-            const result = await paginate<CatEntity>(query, catRepo, config)
+            const result = await paginate(query, catRepo, config)
 
-            // Should get Shadow's record (visited after Garfield)
-            expect(result.data).toStrictEqual([cats[2]])
-            expect(result.meta.firstCursor).toBe('2022-12-21T10:00:00.000Z')
-            expect(result.meta.lastCursor).toBe('2022-12-21T10:00:00.000Z')
-            expect(result.links.previous).toBe(
-                `?limit=2&sortBy=lastVetVisit:DESC&cursor=2022-12-21T10:00:00.000Z&cursorColumn=lastVetVisit&cursorDirection=before`
-            )
-            expect(result.links.next).toBe(
-                `?limit=2&sortBy=lastVetVisit:ASC&cursor=2022-12-21T10:00:00.000Z&cursorColumn=lastVetVisit&cursorDirection=after`
-            )
+            // Should only include fields that exist in both config.select and query.select
+            expect(result.data[0]).toHaveProperty('id')
+            expect(result.data[0]).toHaveProperty('name')
+            expect(result.data[0]).not.toHaveProperty('color')
+            expect(result.data[0]).not.toHaveProperty('age')
         })
 
-        it('should handle date type cursor column with before direction', async () => {
+        it('should restrict wildcard query.select to only fields allowed in config.select', async () => {
+            // Server-side config only allows id, name and toys.id
             const config: PaginateConfig<CatEntity> = {
                 sortableColumns: ['id'],
-                cursorableColumns: ['lastVetVisit'],
-                paginationType: PaginationType.CURSOR,
-                defaultLimit: 2,
+                select: ['id', 'name', 'toys.id'],
+                relations: ['toys'],
             }
+
+            // Client tries to request all fields with wildcards
             const query: PaginateQuery = {
-                path: '',
-                cursor: '2022-12-21T10:00:00.000Z', // Shadow's vet visit
-                cursorColumn: 'lastVetVisit',
-                cursorDirection: 'before',
+                page: 1,
+                limit: 10,
+                select: ['*', 'toys.*'], // Requesting all fields with wildcards
+                path: '/cats',
             }
 
-            const result = await paginate<CatEntity>(query, catRepo, config)
+            const result = await paginate(query, catRepo, config)
 
-            // Should get Milo and Garfield's records (visited before Shadow)
-            expect(result.data).toStrictEqual([cats[1], cats[0]]) // Reversed order due to 'before' direction
-            expect(result.meta.firstCursor).toBe('2022-12-20T10:00:00.000Z')
-            expect(result.meta.lastCursor).toBe('2022-12-19T10:00:00.000Z')
-            expect(result.links.previous).toBe(
-                `?limit=2&sortBy=lastVetVisit:ASC&cursor=2022-12-20T10:00:00.000Z&cursorColumn=lastVetVisit&cursorDirection=after`
-            )
-            expect(result.links.next).toBe(
-                `?limit=2&sortBy=lastVetVisit:DESC&cursor=2022-12-19T10:00:00.000Z&cursorColumn=lastVetVisit&cursorDirection=before`
-            )
+            // Should only include fields that exist in both expanded config.select and expanded query.select
+            expect(result.data[0]).toHaveProperty('id')
+            expect(result.data[0]).toHaveProperty('name')
+            expect(result.data[0]).not.toHaveProperty('color')
+            expect(result.data[0]).not.toHaveProperty('age')
+
+            // Should only have toys.id, not other toy properties
+            expect(result.data[0].toys[0]).toHaveProperty('id')
+            expect(result.data[0].toys[0]).not.toHaveProperty('name')
+            expect(result.data[0].toys[0]).not.toHaveProperty('createdAt')
+        })
+    })
+
+    describe('Filtering across to-many relationship boundaries', () => {
+        let existsSpy
+
+        beforeAll(() => {
+            existsSpy = jest.spyOn(SelectQueryBuilder.prototype, 'andWhereExists')
+        })
+
+        beforeEach(() => {
+            existsSpy.mockClear()
+        })
+
+        afterAll(() => {
+            existsSpy.mockRestore()
+        })
+
+        describe('Filtering records whose related entities match filter criteria', () => {
+            it('should find all cats that have one or more toys that are not toy 0', async () => {
+                // This test tests a direct toMany relationship (.toys) with a single direct filter on it (.toys.id)
+                const config: PaginateConfig<CatEntity> = {
+                    relations: ['toys'],
+                    sortableColumns: ['id', 'toys.id'],
+                    filterableColumns: {
+                        'toys.id': [FilterOperator.EQ, FilterSuffix.NOT],
+                        'toys.(size.height)': [FilterOperator.GT],
+                        'home.name': [FilterOperator.EQ],
+                    },
+                }
+                const query: PaginateQuery = {
+                    filter: {
+                        // Filtering on toMany means "include cats with toys that match the filter",
+                        // in this case "include cats with toys that are not toys with the id of toy 0"
+                        'toys.id': `$not:$eq:${catToys[0].id}`,
+                    },
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                // Cat 0 has toys 0, 1, 2  --> is included because it has toy 1 and 2 which are not toy 0
+                // Cat 1 has toys 3        --> is included
+                // Other cats have no toys --> are not included
+                expect(result.data.length).toBe(2)
+                expect(result.data[0].id).toBe(cats[0].id)
+                expect(result.data[1].id).toBe(cats[1].id)
+
+                // When filtering on toMany relations, the related entities themselves should not be filtered.
+                expect(result.data[0].toys.length).toBe(catToys.filter((t) => t.cat.id === cats[0].id).length)
+            })
+
+            it('should find all cats with one or more toys height 5 that is also not toy 0', async () => {
+                // This test tests a direct toMany relationship (.toys) with multiple filters on it.
+                // It tests that all filters are applied so that only toys match that meet all filters (rather than
+                // all the toys that meet one or more filter criteria), and
+                // it asserts that only a single optimized EXISTS clause is generated.
+                const config: PaginateConfig<CatEntity> = {
+                    relations: ['toys'],
+                    sortableColumns: ['id', 'toys.id'],
+                    filterableColumns: {
+                        'toys.id': [FilterOperator.EQ, FilterSuffix.NOT],
+                        'toys.(size.height)': [FilterOperator.EQ],
+                    },
+                }
+                const query: PaginateQuery = {
+                    filter: {
+                        'toys.id': `$not:$eq:${catToys[0].id}`,
+                        'toys.(size.height)': '$eq:5',
+                    },
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                // Both cat 0 and cat 1 have a toy that is not toy 0, but only cat 0 has a toy with height == 5
+                expect(result.data.length).toBe(1)
+                expect(result.data[0].id).toBe(cats[0].id)
+
+                // When filtering on toMany relations, the related entities themselves should not be filtered.
+                expect(result.data[0].toys.length).toBe(catToys.filter((t) => t.cat.id === cats[0].id).length)
+
+                // Only a single EXISTS clause should be generated
+                expect(existsSpy).toHaveBeenCalledTimes(1)
+            })
+
+            it('should find cats with toys, even when that relationship is not loaded', async () => {
+                // This test tests a regression where filtering by a relationship that did not occur in the `relations`
+                // config would cause the query to fail. e.g. filter on `toys.id` without `toys` in `relations`
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    filterableColumns: {
+                        'toys.(size.height)': [FilterOperator.EQ],
+                    },
+                }
+                const query: PaginateQuery = {
+                    filter: {
+                        'toys.(size.height)': '$eq:5',
+                    },
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                // Only cat 0 has a toy with height == 5
+                expect(result.data.length).toBe(1)
+                expect(result.data[0].id).toBe(cats[0].id)
+                // Filtering by a relationship should not include it in the result
+                expect(result.data[0].toys).toBeUndefined()
+            })
+
+            it('should find all cats with one or more red or teal pillows in their home', async () => {
+                // This test tests toMany relationships that are part of a deeper chain such as cat.home.pillows
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    relations: ['home.pillows'],
+                    filterableColumns: {
+                        'home.pillows.color': [FilterOperator.EQ],
+                    },
+                }
+                const query: PaginateQuery = {
+                    filter: {
+                        'home.pillows.color': [`$or:$eq:red`, `$or:$eq:teal`],
+                    },
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                // Cat 0 has a red pillow in their home, and cat 1 has a teal pillow in their home
+                expect(result.data.length).toBe(2)
+                expect(result.data[0].id).toBe(cats[0].id)
+                expect(result.data[1].id).toBe(cats[1].id)
+
+                // When filtering on toMany relations, the related entities themselves should not be filtered.
+                expect(result.data[0].home.pillows.length).toBe(3)
+
+                // Only a single EXISTS clause should be generated
+                expect(existsSpy).toHaveBeenCalledTimes(1)
+            })
+
+            it('should find all cats with a toy from the shop on main street', async () => {
+                // This test tests that the exists clauses can still correctly deal with nested relations
+                // e.g. toys.shop.address.address
+                //      ^ the toMany relationship with a tail of nested relations
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    filterableColumns: {
+                        'toys.shop.address.address': [FilterOperator.ILIKE],
+                    },
+                }
+                const query: PaginateQuery = {
+                    filter: {
+                        'toys.shop.address.address': [`$ilike:main`],
+                    },
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                // Cat 1 has a toy from the shop on main street
+                expect(result.data.length).toBe(1)
+                expect(result.data[0].id).toBe(cats[0].id)
+
+                // Only a single EXISTS clause should be generated
+                expect(existsSpy).toHaveBeenCalledTimes(1)
+            })
+
+            it('should find all cats with a tall toy and a red pillow in their home', async () => {
+                // This test tests filtering on multiple toMany relationships and asserts the number of EXISTS clauses
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    filterableColumns: {
+                        'home.pillows.color': [FilterOperator.EQ],
+                        'toys.(size.height)': [FilterOperator.GT],
+                    },
+                }
+                const query: PaginateQuery = {
+                    filter: {
+                        'home.pillows.color': [`$eq:red`],
+                        'toys.(size.height)': '$gt:5',
+                    },
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                // Cat 0 has a red pillow in their home, and cat 1 has a teal pillow in their home
+                expect(result.data.length).toBe(1)
+                expect(result.data[0].id).toBe(cats[0].id)
+
+                // 2 EXISTS clauses should be generated, one for each toMany relationship used in the filters
+                expect(existsSpy).toHaveBeenCalledTimes(2)
+            })
+        })
+
+        describe('Filtering records without related entities matching filter criteria', () => {
+            // To be clear: "without" also means any record that simply does not have any related entities at all.
+
+            it('should find all cats without any pillows in their home', async () => {
+                // This test tests absence filtering. Also asserts that the loaded relation is empty.
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    relations: ['home.pillows'],
+                    filterableColumns: {
+                        'home.pillows': [FilterQuantifier.NONE],
+                    },
+                }
+                const query: PaginateQuery = {
+                    filter: {
+                        'home.pillows': [`$none`],
+                    },
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                // Only cat 0 and 1 have pillows
+                expect(result.data.length).toBe(5)
+                // Cat 2 has a home with no pillows
+                expect(result.data[0].id).toBe(cats[2].id)
+                expect(result.data[0].home.pillows).toHaveLength(0)
+                // The rest of the cats have no homes
+                expect(result.data[1].id).toBe(cats[3].id)
+                expect(result.data[1].home).toBeNull()
+                expect(result.data[2].id).toBe(cats[4].id)
+                expect(result.data[2].home).toBeNull()
+                expect(result.data[3].id).toBe(cats[5].id)
+                expect(result.data[3].home).toBeNull()
+                expect(result.data[4].id).toBe(cats[6].id)
+                expect(result.data[4].home).toBeNull()
+            })
+
+            it('should find all cats without red pillows in their home', async () => {
+                // This test tests absence filtering with a single criterium.
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    filterableColumns: {
+                        'home.pillows.color': [FilterQuantifier.NONE],
+                    },
+                }
+                const query: PaginateQuery = {
+                    filter: {
+                        'home.pillows.color': [`$none:red`],
+                    },
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                // Only cat 0 has a red pillow
+                expect(result.data.length).toBe(6)
+                expect(result.data[0].id).toBe(cats[1].id)
+                expect(result.data[1].id).toBe(cats[2].id)
+                expect(result.data[2].id).toBe(cats[3].id)
+                expect(result.data[3].id).toBe(cats[4].id)
+                expect(result.data[4].id).toBe(cats[5].id)
+                expect(result.data[5].id).toBe(cats[6].id)
+            })
+
+            it('should find all cats without red or teal pillows in their home', async () => {
+                // This test tests absence filtering with multiple criteria.
+                const config: PaginateConfig<CatEntity> = {
+                    sortableColumns: ['id'],
+                    filterableColumns: {
+                        'home.pillows.color': [FilterQuantifier.NONE],
+                    },
+                }
+                const query: PaginateQuery = {
+                    filter: {
+                        'home.pillows.color': [`$none:red`, '$or:teal'],
+                    },
+                    path: '',
+                }
+
+                const result = await paginate<CatEntity>(query, catRepo, config)
+                // Cat 0 has a red pillow, and cat 1 has a teal pillow.
+                expect(result.data.length).toBe(5)
+                expect(result.data[0].id).toBe(cats[2].id)
+                expect(result.data[1].id).toBe(cats[3].id)
+                expect(result.data[2].id).toBe(cats[4].id)
+                expect(result.data[3].id).toBe(cats[5].id)
+                expect(result.data[4].id).toBe(cats[6].id)
+            })
+
+            describe('Advanced quantifier combinatorics', () => {
+                // None of these have been implemented yet, feel free to PR :innocent:
+
+                it('should error with multiple different quantifiers on the same column', async () => {
+                    // This test tests absence filtering with multiple criteria.
+                    const config: PaginateConfig<CatEntity> = {
+                        sortableColumns: ['id'],
+                        filterableColumns: {
+                            'home.pillows.color': [FilterQuantifier.NONE, FilterQuantifier.ALL],
+                        },
+                    }
+                    const query: PaginateQuery = {
+                        filter: {
+                            'home.pillows.color': [`$none:red`, `$all:blue`],
+                        },
+                        path: '',
+                    }
+                    await expect(paginate<CatEntity>(query, catRepo, config)).rejects.toBeDefined()
+                })
+
+                it('should error with multiple different quantifiers on the same relationship', async () => {
+                    // This test tests absence filtering with a multiple criterium.
+                    const config: PaginateConfig<CatEntity> = {
+                        sortableColumns: ['id'],
+                        filterableColumns: {
+                            'home.pillows.color': [FilterQuantifier.NONE],
+                            'home.pillows.brand.name': [FilterQuantifier.ALL, FilterOperator.ILIKE],
+                        },
+                    }
+                    const query: PaginateQuery = {
+                        filter: {
+                            'home.pillows.color': [`$none:red`],
+                            'home.pillows.brand.name': [`$all:$ilike:purr`],
+                        },
+                        path: '',
+                    }
+
+                    await expect(paginate<CatEntity>(query, catRepo, config)).rejects.toBeDefined()
+                })
+            })
         })
     })
 })
