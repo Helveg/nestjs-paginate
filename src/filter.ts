@@ -24,6 +24,7 @@ import {
     andWhereNoneExist,
     checkIsArray,
     checkIsEmbedded,
+    checkIsJson,
     checkIsRelation,
     createRelationSchema,
     extractVirtualProperty,
