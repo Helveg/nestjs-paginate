@@ -443,8 +443,16 @@ export async function paginate<T extends ObjectLiteral>(
 
     if (query.sortBy) {
         for (const order of query.sortBy) {
-            if (isEntityKey(config.sortableColumns, order[0]) && ['ASC', 'DESC'].includes(order[1])) {
-                sortBy.push(order as Order<T>)
+            const orderColumn = order[0]
+            const isSortable = (column: string) => isEntityKey(config.sortableColumns, column)
+            if (['ASC', 'DESC'].includes(order[1])) {
+                if (Array.isArray(orderColumn)) {
+                    if (orderColumn.every((o) => isSortable(o))) {
+                        sortBy.push(order as Order<T>)
+                    }
+                } else if (isSortable(orderColumn)) {
+                    sortBy.push(order as Order<T>)
+                }
             }
         }
     }
@@ -585,7 +593,7 @@ export async function paginate<T extends ObjectLiteral>(
             }
 
             const cursorExpressions = sortBy.map(([column, direction]) => {
-                const columnProperties = getPropertiesByColumnName(column)
+                const columnProperties = getPropertiesByColumnName(column as string)
                 const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(
                     queryBuilder,
                     columnProperties
@@ -685,14 +693,37 @@ export async function paginate<T extends ObjectLiteral>(
         }
 
         for (const order of sortBy) {
-            const columnProperties = getPropertiesByColumnName(order[0])
-            const { isVirtualProperty } = extractVirtualProperty(queryBuilder, columnProperties)
-            const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
-            const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
-            let alias = fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, isVirtualProperty, isEmbedded)
-
-            if (isVirtualProperty) {
-                alias = quoteColumn(alias, isMySqlOrMariaDb)
+            let alias: string
+            if (Array.isArray(order[0])) {
+                const parts = []
+                for (const column of order[0]) {
+                    const columnProperties = getPropertiesByColumnName(column)
+                    const { isVirtualProperty } = extractVirtualProperty(queryBuilder, columnProperties)
+                    const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
+                    const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
+                    let columnAlias = fixColumnAlias(
+                        columnProperties,
+                        queryBuilder.alias,
+                        isRelation,
+                        isVirtualProperty,
+                        isEmbedded
+                    )
+                    if (isVirtualProperty) {
+                        columnAlias = quoteColumn(columnAlias, isMySqlOrMariaDb)
+                    }
+                    parts.push(columnAlias)
+                }
+                alias = `_polymorph_${parts.join('_').replace(/\./g, '_')}`
+                queryBuilder.addSelect(`COALESCE(${parts.join(',')})`, alias)
+            } else {
+                const columnProperties = getPropertiesByColumnName(order[0])
+                const { isVirtualProperty } = extractVirtualProperty(queryBuilder, columnProperties)
+                const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
+                const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
+                alias = fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, isVirtualProperty, isEmbedded)
+                if (isVirtualProperty) {
+                    alias = quoteColumn(alias, isMySqlOrMariaDb)
+                }
             }
 
             if (isMySqlOrMariaDb) {

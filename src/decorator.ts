@@ -15,7 +15,7 @@ function isExpressRequest(request: unknown): request is ExpressRequest {
 export interface PaginateQuery {
     page?: number
     limit?: number
-    sortBy?: [string, string][]
+    sortBy?: [string | string[], string][]
     searchBy?: string[]
     search?: string
     filter?: { [column: string]: string | string[] }
