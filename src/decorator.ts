@@ -96,8 +96,8 @@ export const Paginate = createParamDecorator((_data: unknown, ctx: ExecutionCont
     }
 
     const searchBy = parseParam<string>(query.searchBy, singleSplit)
-    const sortBy = parseParam<[string, string]>(query.sortBy, multipleSplit).map(([column, order]) => {
-        const parts = column.split('~');
+    const sortBy = parseParam<[string, string]>(query.sortBy, multipleSplit)?.map(([column, order]) => {
+        const parts = column.split('~')
         return [parts.length > 1 ? parts : column, order] as [string | string[], string]
     })
     const select = parseParam<string>(query.select, multipleAndCommaSplit)
