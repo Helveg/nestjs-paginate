@@ -31,12 +31,19 @@ import {
     extractVirtualProperty,
     fixColumnAlias,
     getPropertiesByColumnName,
+    isBooleanColumnType,
     isDateColumnType,
+    isDateOnlyColumnType,
+    isFiniteNumericString,
     isISODate,
+    isISODateOnly,
+    isNumberColumnType,
     JoinMethod,
     JSON_COLUMN_TYPES,
     mergeRelationSchema,
+    parseBooleanToken,
     quoteColumn,
+    resolveColumnType,
     resolveJsonbPath,
 } from './helper'
 import { EmbeddedMetadata } from 'typeorm/metadata/EmbeddedMetadata'
@@ -364,41 +371,47 @@ export function parseFilterToken(raw?: string): FilterToken | null {
 }
 
 /**
- * Resolves the type of a (possibly nested) relation column's leaf, e.g. `a.b.leaf`, by walking the
- * relation chain hop by hop — `extractVirtualProperty` only resolves a single hop. Used to coerce
- * polymorphic (`~`) filter values, whose raw COALESCE has no query-builder-typed parameter and so
- * would otherwise compare as text on type-strict drivers (SQLite). Returns undefined if any hop or
- * the leaf column can't be resolved.
+ * Builds a value coercer for a filter column by classifying the column's type from entity
+ * metadata, so a raw query-string token is bound as the JavaScript type the database expects
+ * (a type-strict driver such as better-sqlite3 will otherwise never match a string against a
+ * number/boolean/date column).
+ *
+ * Coercion is deliberately conservative: a value is only converted when the column type calls
+ * for it AND the value clearly denotes that type (a finite number, a closed boolean token set,
+ * an ISO date). Precision-sensitive types (bigint, decimal, numeric) are left as strings — see
+ * {@link isNumberColumnType}. When the type cannot be resolved (virtual/computed columns), the
+ * value is passed through unchanged.
  */
-function resolveLeafColumnType(qb: SelectQueryBuilder<unknown>, column: string): unknown {
-    const segments = column.split('.')
-    const leaf = segments[segments.length - 1]
-    let metadata = qb?.expressionMap?.mainAlias?.metadata
-    for (const relationName of segments.slice(0, -1)) {
-        const relation = metadata?.relations.find((r) => r.propertyPath === relationName)
-        if (!relation) return undefined
-        metadata = relation.inverseEntityMetadata
-    }
-    return metadata?.columns?.find((c) => c.propertyName === leaf)?.type
-}
-
 function fixColumnFilterValue<T>(column: string, qb: SelectQueryBuilder<T>, isJsonb = false) {
-    const isPolymorphic = column.includes('~')
-    // A polymorphic `a~b` column has no metadata of its own; coerce values using its first part,
-    // so e.g. a numeric COALESCE compares numerically on type-strict drivers (SQLite). The first
-    // part may be nested (`a.b.leaf`), so walk the relation chain to the leaf's type.
-    const typeColumn = isPolymorphic ? column.split('~')[0] : column
-    const columnProperties = getPropertiesByColumnName(typeColumn)
-    const columnType = isPolymorphic
-        ? resolveLeafColumnType(qb, typeColumn)
-        : extractVirtualProperty(qb, columnProperties).type
+    // A polymorphic `a~b` column has no metadata of its own; classify using its first part's leaf
+    // type so e.g. a numeric COALESCE compares numerically on type-strict drivers (SQLite). The
+    // part may be nested (`a.b.leaf`), which resolveColumnType walks to the leaf column.
+    const typeColumn = column.includes('~') ? column.split('~')[0] : column
+    const columnType = resolveColumnType(qb, typeColumn)
 
-    return (value: string) => {
-        if ((isDateColumnType(columnType) || isJsonb) && isISODate(value)) {
+    return (value: string): string | number | boolean | Date => {
+        // Temporal columns: a full ISO timestamp is always accepted; a date-only string
+        // (YYYY-MM-DD) is accepted for datetime/timestamp and date columns. JSONB values also
+        // accept ISO timestamps. `isDateColumnType` is intentionally not broadened to the
+        // date-only type so cursor pagination (which calls Date.getTime()) stays unaffected.
+        const isTemporal = isDateColumnType(columnType) || isDateOnlyColumnType(columnType)
+        if ((isTemporal || isJsonb) && isISODate(value)) {
+            return new Date(value)
+        }
+        if (isTemporal && isISODateOnly(value)) {
             return new Date(value)
         }
 
-        if ((columnType === Number || columnType === 'number' || isJsonb) && !isNaN(Number(value))) {
+        // Boolean columns: only the closed token set (true/false/1/0) is coerced, so a value
+        // meant as text on a non-boolean column is never silently reinterpreted.
+        if (isBooleanColumnType(columnType)) {
+            const bool = parseBooleanToken(value)
+            if (bool !== undefined) return bool
+        }
+
+        // Numeric columns that fit a JS double (bigint/decimal excluded to preserve precision),
+        // plus numeric JSONB leaves.
+        if ((isNumberColumnType(columnType) || isJsonb) && isFiniteNumericString(value)) {
             return Number(value)
         }
 
