@@ -49,6 +49,16 @@ import {
 import { EmbeddedMetadata } from 'typeorm/metadata/EmbeddedMetadata'
 import { RelationMetadata } from 'typeorm/metadata/RelationMetadata'
 import { addRelationsFromSchema } from './paginate'
+import {
+    buildDistanceExpression,
+    DistanceColumnConfig,
+    distanceColumnStem,
+    isDistanceColumn,
+    parseDistanceColumn,
+} from './distance'
+
+/** Per-column distance configuration, keyed by the name used in `<name>:$dist:lat,lng`. */
+export type DistanceColumns = Record<string, DistanceColumnConfig>
 
 export enum FilterOperator {
     EQ = '$eq',
@@ -278,27 +288,44 @@ function buildPolymorphicCoalesce(qb: SelectQueryBuilder<any>, column: string): 
     return `COALESCE(${refs.join(', ')})`
 }
 
+/** Looks up the `DistanceColumnConfig` for a distance column reference, throwing if unconfigured. */
+function resolveDistanceConfig(distanceColumns: DistanceColumns | undefined, column: string): DistanceColumnConfig {
+    const { name } = parseDistanceColumn(column)
+    const config = distanceColumns?.[name]
+    if (!config) {
+        throw new BadRequestException(`No 'distanceColumns' config for distance column "${name}".`)
+    }
+    return config
+}
+
 export function addWhereCondition<T>(
     qb: SelectQueryBuilder<T>,
     column: string,
     filter: ColumnFilters,
-    paramKeySuffix = ''
+    paramKeySuffix = '',
+    distanceColumns?: DistanceColumns
 ) {
     const isPolymorphic = column.includes('~')
+    // A distance column (`name:$dist:lat,lng`) resolves to a computed scalar expression rather than
+    // an entity column; the ordinary value-side operator ($lt, $btw, …) is applied against it.
+    const distance = isDistanceColumn(column)
+    const isDerived = isPolymorphic || distance
     const columnProperties = getPropertiesByColumnName(column)
-    const { isVirtualProperty, query: virtualQuery } = isPolymorphic
+    const { isVirtualProperty, query: virtualQuery } = isDerived
         ? { isVirtualProperty: false, query: undefined }
         : extractVirtualProperty(qb, columnProperties)
-    const isRelation = !isPolymorphic && checkIsRelation(qb, columnProperties.propertyPath)
-    const isEmbedded = !isPolymorphic && checkIsEmbedded(qb, columnProperties.propertyPath)
-    const isArray = !isPolymorphic && checkIsArray(qb, columnProperties.propertyName)
+    const isRelation = !isDerived && checkIsRelation(qb, columnProperties.propertyPath)
+    const isEmbedded = !isDerived && checkIsEmbedded(qb, columnProperties.propertyPath)
+    const isArray = !isDerived && checkIsArray(qb, columnProperties.propertyName)
 
-    const alias = isPolymorphic
+    const alias = distance
+        ? buildDistanceExpression(qb, resolveDistanceConfig(distanceColumns, column), parseDistanceColumn(column))
+        : isPolymorphic
         ? buildPolymorphicCoalesce(qb, column)
         : fixColumnAlias(columnProperties, qb.alias, isRelation, isVirtualProperty, isEmbedded, virtualQuery, qb)
 
-    // `~` is not a valid parameter-name character, so sanitise it for polymorphic columns.
-    const paramColumn = isPolymorphic ? column.replace(/[^a-zA-Z0-9_]/g, '_') : columnProperties.column
+    // `~`, `:$dist:` and `,` are not valid parameter-name characters, so sanitise derived columns.
+    const paramColumn = isDerived ? column.replace(/[^a-zA-Z0-9_]/g, '_') : columnProperties.column
 
     filter[column].forEach((columnFilter: Filter, index: number) => {
         // The suffix keeps parameter names unique when the same column appears in several
@@ -435,13 +462,17 @@ export function parseFilter<T>(
         return {}
     }
     for (const column of Object.keys(query.filter)) {
-        if (!(column in filterableColumns)) {
+        // A distance column (`name:$dist:lat,lng`) is whitelisted by its stem (`name:$dist`); the
+        // origin varies per request so it can't be listed verbatim.
+        const distance = isDistanceColumn(column)
+        const allowKey = distance ? distanceColumnStem(column) : column
+        if (!(allowKey in filterableColumns)) {
             if (throwOnInvalidFilter) {
                 throw new BadRequestException(`Column '${column}' is not filterable`)
             }
             continue
         }
-        const allowedOperators = filterableColumns[column]
+        const allowedOperators = filterableColumns[allowKey]
         const input = query.filter[column]
         const statements = !Array.isArray(input) ? [input] : input
         for (const raw of statements) {
@@ -496,10 +527,16 @@ export function parseFilter<T>(
                 findOperator: undefined,
             }
 
-            const fixValue = fixColumnFilterValue(column, qb)
+            // Distance columns compare a computed metre value, so coerce to Number; their colon
+            // syntax has no entity metadata to classify and is never a JSONB path.
+            const fixValue = distance
+                ? (value: string) => (value != null && !isNaN(Number(value)) ? Number(value) : value)
+                : fixColumnFilterValue(column, qb)
 
             const columnProperties = getPropertiesByColumnName(column)
-            const jsonbResolution = resolveJsonbPath(qb, columnProperties.column)
+            const jsonbResolution = distance
+                ? { isJsonb: false as const, relationPath: [], jsonbColumn: '', jsonPath: [] }
+                : resolveJsonbPath(qb, columnProperties.column)
 
             switch (token.operator) {
                 case FilterOperator.BTW:
@@ -765,7 +802,8 @@ export function addFilter<T>(
         [column: string]: (FilterOperator | FilterSuffix | FilterQuantifier)[] | true
     },
     opts: AddFilterOptions = {},
-    throwOnInvalidFilter = false
+    throwOnInvalidFilter = false,
+    distanceColumns?: DistanceColumns
 ) {
     const { subFilter = false } = opts
     const filter = parseFilter(query, filterableColumns, qb, throwOnInvalidFilter)
@@ -776,7 +814,7 @@ export function addFilter<T>(
         if (key.includes('~')) preparePolymorphicColumn(qb, key)
     }
 
-    addDirectFilters(qb, filter, subFilter)
+    addDirectFilters(qb, filter, subFilter, distanceColumns)
     addToManySubFilters(qb, filter, query, filterableColumns, opts)
 
     const columnJoinMethods: ColumnJoinMethods = {}
@@ -897,19 +935,31 @@ function applyExpressionLeaf(
     }
 }
 
-export function addDirectFilters<T>(qb: SelectQueryBuilder<T>, filter: ColumnFilters, subFilter = false) {
+export function addDirectFilters<T>(
+    qb: SelectQueryBuilder<T>,
+    filter: ColumnFilters,
+    subFilter = false,
+    distanceColumns?: DistanceColumns
+) {
     const metadata = qb.expressionMap.mainAlias.metadata
 
-    // Top level: only root/embedded/polymorphic columns are direct WHERE clauses; every relation
-    // filter becomes an EXISTS subquery. Inside a subquery, to-one relations are joined locally and
-    // stay direct, and only to-many relations are lifted into nested EXISTS.
+    // Top level: only root/embedded/polymorphic/distance columns are direct WHERE clauses; every
+    // relation filter becomes an EXISTS subquery. Inside a subquery, to-one relations are joined
+    // locally and stay direct, and only to-many relations are lifted into nested EXISTS. Distance
+    // columns are always direct (they compare a computed scalar, never a relation).
     const findRelation = subFilter ? findFirstToManyRelationship : findFirstRelationship
-    const directColumns = Object.keys(filter).filter((key) => key.includes('~') || !findRelation(key, metadata))
+    const directColumns = Object.keys(filter).filter(
+        (key) => key.includes('~') || isDistanceColumn(key) || !findRelation(key, metadata)
+    )
 
     // Columns are ANDed; each is wrapped in its own brackets so a column's own OR group
     // (e.g. a JSONB `$in` expansion) stays self-contained.
     for (const column of directColumns) {
-        qb.andWhere(new Brackets((bracket: SelectQueryBuilder<T>) => addWhereCondition(bracket, column, filter)))
+        qb.andWhere(
+            new Brackets((bracket: SelectQueryBuilder<T>) =>
+                addWhereCondition(bracket, column, filter, '', distanceColumns)
+            )
+        )
     }
 }
 
