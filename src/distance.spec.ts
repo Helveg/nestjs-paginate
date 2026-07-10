@@ -232,6 +232,31 @@ describe('distance columns ($dist)', () => {
         await expect(paginate(query, placeRepo, config)).rejects.toThrow(/not filterable/)
     })
 
+    it('never auto-allows a distance column under allowDepth', async () => {
+        const config: PaginateConfig<PlaceEntity> = {
+            sortableColumns: ['id'],
+            filterableColumns: {},
+            distanceColumns: { pos: { lat: 'lat', lng: 'lng' } },
+            allowDepth: 8,
+            throwOnInvalidFilter: true,
+        }
+        const query: PaginateQuery = { path: '', filter: { [`pos:$dist:${ORIGIN_ARG}`]: '$lt:1000' } }
+        // A distance column is not an entity column, so it is never synthesised: only its
+        // explicitly whitelisted `pos:$dist` stem opens it up.
+        await expect(paginate(query, placeRepo, config)).rejects.toThrow(/not filterable/)
+    })
+
+    it('still applies a whitelisted distance stem when allowDepth is set', async () => {
+        const config: PaginateConfig<PlaceEntity> = { ...haversineConfig, allowDepth: 8 }
+        const query: PaginateQuery = {
+            path: '',
+            filter: { [`pos:$dist:${ORIGIN_ARG}`]: '$lt:100000' },
+            sortBy: [[`pos:$dist:${ORIGIN_ARG}`, 'ASC']],
+        }
+        const result = await paginate(query, placeRepo, config)
+        expect(names(result.data)).toStrictEqual(['Brussels', 'Antwerp', 'Ghent'])
+    })
+
     it('throws when a whitelisted distance stem has no distanceColumns config', async () => {
         const config: PaginateConfig<PlaceEntity> = {
             sortableColumns: ['id', 'pos:$dist'],

@@ -56,6 +56,7 @@ import {
     RelationSchema,
     RelationSchemaInput,
     resolveJsonbPath,
+    resolvesToColumn,
     SortBy,
 } from './helper'
 import { collectFilterExpressionColumns } from './filter-expression'
@@ -125,10 +126,11 @@ export interface PaginateConfig<T> {
      * alternative.
      *
      * Only columns actually referenced by the request (via `filter.*`, a `filter=` expression, or
-     * `sortBy`) are considered — this does not open every possible path, it simply skips the
-     * allowlist check for shallow-enough ones. An explicit {@link filterableColumns} entry always
-     * takes precedence, so per-column operator restrictions still apply even within the allowed
-     * depth.
+     * `sortBy`) and resolvable against the entity metadata are considered — this does not open every
+     * possible path, it simply skips the allowlist check for shallow-enough real columns. An
+     * explicit {@link filterableColumns} entry always takes precedence, so per-column operator
+     * restrictions still apply even within the allowed depth. A distance column is never
+     * auto-allowed; whitelist its `<name>:$dist` stem explicitly.
      */
     allowDepth?: number
     /**
@@ -174,8 +176,10 @@ function columnPathDepth(column: string): number {
  * Resolves the effective filterable-columns map for a request, honouring `config.allowDepth`.
  *
  * For every column the request actually references (`filter.*` keys and `filter=` expression
- * leaves) that is not already listed and whose depth is within `allowDepth`, a synthetic `true`
- * entry is added so the downstream allowlist check passes. Explicit `filterableColumns` entries are
+ * leaves) that is not already listed, resolves against the entity metadata, and whose depth is
+ * within `allowDepth`, a synthetic `true` entry is added so the downstream allowlist check passes.
+ * A column that resolves to nothing is left out, so it fails the allowlist check like any other
+ * unknown column instead of reaching the query builder. Explicit `filterableColumns` entries are
  * layered on top, so their per-column operator restrictions always win. Because the entries carry
  * the full column path, the existing relation sub-filter machinery (which re-scopes by prefix)
  * validates nested and to-many paths without any further changes. When `allowDepth` is unset the
@@ -184,6 +188,7 @@ function columnPathDepth(column: string): number {
 function withDepthAllowedColumns<T>(
     config: PaginateConfig<T>,
     query: PaginateQuery,
+    metadata: EntityMetadata,
     filterExpressionMaxComplexity: number
 ): PaginateConfig<T>['filterableColumns'] {
     if (config.allowDepth == null) {
@@ -203,6 +208,7 @@ function withDepthAllowedColumns<T>(
     const synthetic: Record<string, true> = {}
     for (const column of referenced) {
         if (config.filterableColumns && column in config.filterableColumns) continue
+        if (!resolvesToColumn(metadata, column)) continue
         if (columnPathDepth(column) <= config.allowDepth) synthetic[column] = true
     }
 
@@ -213,13 +219,19 @@ function withDepthAllowedColumns<T>(
  * Resolves the effective sortable-columns list for a request, honouring `config.allowDepth`.
  *
  * For every column the request actually references (via `sortBy`, including each alternative of a
- * polymorphic `a~b` group) that is not already listed and whose depth is within `allowDepth`, a
- * synthetic entry is appended so the downstream `isEntityKey` allowlist check passes. Because the
- * entries carry the full column path, the existing relation ordering machinery (which joins by
- * prefix) handles nested paths without any further changes. When `allowDepth` is unset the
+ * polymorphic `a~b` group) that is not already listed, resolves against the entity metadata, and
+ * whose depth is within `allowDepth`, a synthetic entry is appended so the downstream `isEntityKey`
+ * allowlist check passes. A column that resolves to nothing is left out and is ignored like any
+ * other unknown sort column — a distance column stem included, since it is not an entity column.
+ * Because the entries carry the full column path, the existing relation ordering machinery (which
+ * joins by prefix) handles nested paths without any further changes. When `allowDepth` is unset the
  * configured list is returned unchanged.
  */
-function withDepthAllowedSortColumns<T>(config: PaginateConfig<T>, query: PaginateQuery): WidenedColumn<T>[] {
+function withDepthAllowedSortColumns<T>(
+    config: PaginateConfig<T>,
+    query: PaginateQuery,
+    metadata: EntityMetadata
+): WidenedColumn<T>[] {
     if (config.allowDepth == null) {
         return config.sortableColumns
     }
@@ -235,6 +247,7 @@ function withDepthAllowedSortColumns<T>(config: PaginateConfig<T>, query: Pagina
     const synthetic: Column<T>[] = []
     for (const column of referenced) {
         if (isEntityKey(config.sortableColumns, column)) continue
+        if (!resolvesToColumn(metadata, column)) continue
         if (columnPathDepth(column) <= config.allowDepth) synthetic.push(column as Column<T>)
     }
 
@@ -570,7 +583,9 @@ export async function paginate<T extends ObjectLiteral>(
         logAndThrowException("Missing required 'sortableColumns' config.")
     }
 
-    const sortableColumns = withDepthAllowedSortColumns(config, query)
+    const entityMetadata = isRepository(repo) ? repo.metadata : repo.expressionMap.mainAlias.metadata
+
+    const sortableColumns = withDepthAllowedSortColumns(config, query, entityMetadata)
 
     const sortBy = [] as SortBy<T>
 
@@ -825,7 +840,7 @@ export async function paginate<T extends ObjectLiteral>(
 
     const filterExpressionMaxComplexity =
         config.filterExpressionMaxComplexity ?? globalConfig.defaultFilterExpressionMaxComplexity
-    const filterableColumns = withDepthAllowedColumns(config, query, filterExpressionMaxComplexity)
+    const filterableColumns = withDepthAllowedColumns(config, query, entityMetadata, filterExpressionMaxComplexity)
 
     let filterJoinMethods = {}
     if (query.filter) {
