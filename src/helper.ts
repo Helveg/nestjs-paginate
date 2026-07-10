@@ -197,6 +197,45 @@ export function checkIsRelation(qb: SelectQueryBuilder<unknown>, propertyPath: s
     return !!qb?.expressionMap?.mainAlias?.metadata?.hasRelationWithPropertyPath(propertyPath)
 }
 
+/**
+ * Whether a dot-path terminates on a relation rather than a column, e.g. `home` or `home.pillows`
+ * (as opposed to `home.street`). Such a column names the relation itself, so it carries no value to
+ * compare — it can only be tested for presence (`$any`) or absence (`$none`).
+ *
+ * Walks relations into their inverse entity and embeddeds into their own metadata, so it resolves
+ * nested paths of any depth.
+ */
+export function isRelationPath(qb: SelectQueryBuilder<unknown>, column: string): boolean {
+    let metadata: EntityMetadata | EmbeddedMetadata | undefined = qb?.expressionMap?.mainAlias?.metadata
+    if (!metadata) {
+        return false
+    }
+
+    const segments = column.split('.')
+    for (let i = 0; i < segments.length; i++) {
+        const name = segments[i].replace(/[()]/g, '')
+
+        const relation = metadata.relations?.find((r) => r.propertyName === name)
+        if (relation) {
+            if (i === segments.length - 1) {
+                return true
+            }
+            metadata = relation.inverseEntityMetadata
+            continue
+        }
+
+        const embedded = metadata.embeddeds?.find((e) => e.propertyName === name)
+        if (embedded) {
+            metadata = embedded
+            continue
+        }
+
+        return false
+    }
+
+    return false
+}
+
 export function checkIsNestedRelation(qb: SelectQueryBuilder<unknown>, propertyPath: string): boolean {
     let metadata = qb?.expressionMap?.mainAlias?.metadata
     for (const relationName of propertyPath.split('.')) {
