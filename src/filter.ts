@@ -122,7 +122,17 @@ export const OperatorSymbolToFunction = new Map<
     [FilterOperator.CONTAINS, ArrayContains],
 ])
 
-type Filter = { quantifier: FilterQuantifier; comparator: FilterComparator; findOperator: FindOperator<string> }
+type Filter = {
+    quantifier: FilterQuantifier
+    comparator: FilterComparator
+    findOperator: FindOperator<string>
+    /**
+     * A bare `$any`/`$none` on a relation column: the quantifier is the whole predicate, so this
+     * filter contributes no condition of its own. The relation still joins, and that join is what
+     * decides whether the row exists.
+     */
+    bare?: boolean
+}
 type ColumnFilters = { [columnName: string]: Filter[] }
 type ColumnJoinMethods = { [columnName: string]: JoinMethod }
 
@@ -554,6 +564,7 @@ export function parseFilter<T>(
             const params: (typeof filter)[0][0] = {
                 quantifier: token.quantifier,
                 comparator: token.comparator,
+                bare: isBareQuantifier(token),
                 findOperator: undefined,
             }
 
@@ -979,7 +990,13 @@ export function addDirectFilters<T>(
     // columns are always direct (they compare a computed scalar, never a relation).
     const findRelation = subFilter ? findFirstToManyRelationship : findFirstRelationship
     const directColumns = Object.keys(filter).filter(
-        (key) => key.includes('~') || isDistanceColumn(key) || !findRelation(key, metadata)
+        (key) =>
+            // A bare `$any`/`$none` names a relation and carries no value; comparing the relation's
+            // key against that absent value would render `<fk> = NULL`, which is never true, so the
+            // EXISTS it sits in would match nothing (and its NOT EXISTS, everything). The quantifier
+            // is applied by addToManySubFilters, and the relation's join already decides existence.
+            !filter[key].every((columnFilter) => columnFilter.bare) &&
+            (key.includes('~') || isDistanceColumn(key) || !findRelation(key, metadata))
     )
 
     // Columns are ANDed; each is wrapped in its own brackets so a column's own OR group
