@@ -42,6 +42,7 @@ import {
     getQueryUrlComponents,
     isDateColumnType,
     isEntityKey,
+    isOrderableColumn,
     isFindOperator,
     isISODate,
     isNil,
@@ -596,18 +597,22 @@ export async function paginate<T extends ObjectLiteral>(
                 continue
             }
             // A polymorphic group (e.g. `colA~colB`) is valid only when every
-            // column in the group is sortable.
+            // column in the group is sortable. A column that names no single value (a relation, a
+            // `json` blob) cannot be ordered by at all: TypeORM would compile it to SQL the
+            // database rejects, so drop it like any other unsortable column.
+            const sortable = (c: string) => isEntityKey(sortableColumns, c) && isOrderableColumn(metadata, c)
             if (Array.isArray(column)) {
-                if (column.length > 0 && column.every((c) => isEntityKey(sortableColumns, c))) {
+                if (column.length > 0 && column.every(sortable)) {
                     sortBy.push(order as Order<T>)
                 }
             } else if (isDistanceColumn(column)) {
                 // A distance column (`name:$dist:lat,lng`) is sortable when its `name:$dist` stem is
-                // whitelisted; the origin varies per request so it can't be listed verbatim.
+                // whitelisted; the origin varies per request so it can't be listed verbatim. It is a
+                // computed scalar, not an entity column, so orderability does not apply.
                 if (isEntityKey(sortableColumns, distanceColumnStem(column))) {
                     sortBy.push(order as Order<T>)
                 }
-            } else if (isEntityKey(sortableColumns, column)) {
+            } else if (sortable(column)) {
                 sortBy.push(order as Order<T>)
             }
         }
