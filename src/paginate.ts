@@ -43,6 +43,7 @@ import {
     isDateColumnType,
     isEntityKey,
     isOrderableColumn,
+    needsJsonbSortCast,
     isFindOperator,
     isISODate,
     isNil,
@@ -1009,6 +1010,18 @@ export async function paginate<T extends ObjectLiteral>(
                 alias = vcSortAlias
             } else if (isVirtualProperty) {
                 alias = quoteColumn(alias, isMySqlOrMariaDb)
+            }
+
+            if (!Array.isArray(order[0]) && needsJsonbSortCast(queryBuilder, order[0] as string)) {
+                // The cast makes this a raw expression, which the query builder no longer escapes
+                // for us — so escape the identifier here, or Postgres folds it to lower case.
+                const escape = (identifier: string) => queryBuilder.connection.driver.escape(identifier)
+                const separator = alias.indexOf('.')
+                const quoted =
+                    separator === -1
+                        ? escape(alias)
+                        : `${escape(alias.slice(0, separator))}.${escape(alias.slice(separator + 1))}`
+                alias = `${quoted}::jsonb`
             }
 
             if (isMySqlOrMariaDb) {
